@@ -1,2 +1,4 @@
 accounts.txt
 __pycache__/
+.roomload.json
+.venv/

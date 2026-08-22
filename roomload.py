@@ -218,6 +218,8 @@ class ImqClient(object):
         self.closed_by_server = False
         self.debug_frames = False
         self.on_message = None
+        self.on_close = None
+        self._close_fired = False
         self.send_lock = threading.Lock()
 
     def _next_op(self):
@@ -287,34 +289,67 @@ class ImqClient(object):
         # all traffic (including subscribe results) until it gets this.
         self._send(C2G_OPEN_FLOODGATES, b'')
 
-    def subscribe(self, queue, retries=5):
-        for attempt in range(retries):
-            op = self._next_op()
-            subscription = p_str(1, queue) + p_uint(2, op)
-            msg = p_bytes(2, subscription)  # queues_with_results
-            self._send(C2G_SUBSCRIBE, msg)
-            try:
-                while True:
-                    mtype, fields = self.read_frame()
-                    if self.debug_frames:
-                        print('    [frame] type %d fields %s' % (mtype, fields))
-                    if mtype == G2C_RESULT:
-                        ops = field_values(fields, 1)
-                        status = field_values(fields, 2)[0]
-                        if ops and ops[0] == op:
-                            if status != 0:
-                                raise BackendError('subscribe %s failed, status %d' % (queue, status))
-                            return
-                    elif mtype == G2C_JOINED_QUEUE:
-                        queues = field_values(fields, 2)
-                        if queues and queues[0].decode('utf-8', 'replace') == queue:
-                            return
-                    else:
-                        self._handle_async(mtype, fields)
-            except socket.timeout:
-                if attempt + 1 < retries:
-                    continue
-                raise BackendError('subscribe %s timed out after %d tries' % (queue, retries))
+    def subscribe(self, queue, retries=5, wait=12.0):
+        """Subscribe and keep pinging so a slow ACK does not drop the socket."""
+        old = self.sock.gettimeout() if self.sock else None
+        if self.sock:
+            self.sock.settimeout(2.0)
+        last_err = None
+        try:
+            for attempt in range(retries):
+                if self.closed_by_server:
+                    raise BackendError('IMQ connection closed by peer')
+                op = self._next_op()
+                subscription = p_str(1, queue) + p_uint(2, op)
+                msg = p_bytes(2, subscription)  # queues_with_results
+                self._send(C2G_SUBSCRIBE, msg)
+                started = time.monotonic()
+                last_ping = started
+                try:
+                    while time.monotonic() - started < wait:
+                        if self.closed_by_server:
+                            raise BackendError('IMQ connection closed by peer')
+                        now = time.monotonic()
+                        if now - last_ping >= PING_INTERVAL:
+                            self.ping()
+                            last_ping = now
+                        try:
+                            mtype, fields = self.read_frame()
+                        except socket.timeout:
+                            continue
+                        if self.debug_frames:
+                            print('    [frame] type %d fields %s' % (mtype, fields))
+                        if mtype == G2C_RESULT:
+                            ops = field_values(fields, 1)
+                            status = field_values(fields, 2)[0]
+                            if ops and ops[0] == op:
+                                if status != 0:
+                                    raise BackendError(
+                                        'subscribe %s failed, status %d'
+                                        % (queue, status))
+                                return
+                        elif mtype == G2C_JOINED_QUEUE:
+                            queues = field_values(fields, 2)
+                            if queues and queues[0].decode('utf-8', 'replace') == queue:
+                                return
+                        else:
+                            self._handle_async(mtype, fields)
+                    last_err = BackendError(
+                        'subscribe %s timed out' % queue)
+                except BackendError as e:
+                    if 'closed by peer' in str(e).lower():
+                        raise
+                    if 'failed, status' in str(e):
+                        raise
+                    last_err = e
+            raise last_err or BackendError(
+                'subscribe %s timed out after %d tries' % (queue, retries))
+        finally:
+            if self.sock and old is not None:
+                try:
+                    self.sock.settimeout(old)
+                except Exception:
+                    pass
     def send_chat(self, queue, payload):
         op = self._next_op()
         msg = (p_uint(1, op)
@@ -340,24 +375,42 @@ class ImqClient(object):
         elif mtype == G2C_PONG:
             self.pongs += 1
         elif mtype == G2C_CONNECTION_CLOSED:
-            self.closed_by_server = True
+            self._fire_close()
 
-    def run_until(self, stop_event, deadline=None):
-        """Drain frames; ping after PING_INTERVAL idle seconds. Returns when
-        stop_event is set or the server closes the connection."""
+    def _fire_close(self):
+        self.closed_by_server = True
+        if self._close_fired:
+            return
+        self._close_fired = True
+        cb = self.on_close
+        if cb:
+            try:
+                cb()
+            except Exception:
+                pass
+
+    def run_until(self, stop_event, deadline=None, extra_stop=None):
+        """Drain frames; ping every PING interval on a fixed schedule (like
+        the real client) so the server does not drop us in a busy room."""
         self.sock.settimeout(2.0)
-        last_traffic = time.monotonic()
+        last_ping = time.monotonic()
         while not stop_event.is_set() and not self.closed_by_server:
+            if extra_stop is not None and extra_stop.is_set():
+                return
             if deadline is not None and time.time() >= deadline:
                 return
             try:
                 mtype, fields = self.read_frame()
                 self._handle_async(mtype, fields)
-                last_traffic = time.monotonic()
             except socket.timeout:
-                if time.monotonic() - last_traffic >= PING_INTERVAL:
-                    self.ping()
-                    last_traffic = time.monotonic()
+                pass
+            except (BackendError, socket.error, ssl.SSLError, OSError):
+                self.closed_by_server = True
+                return
+            now = time.monotonic()
+            if now - last_ping >= PING_INTERVAL:
+                self.ping()
+                last_ping = now
 
     def close(self):
         if not self.sock:
@@ -392,9 +445,14 @@ class AccountSession(object):
         self.cycles = 0
         self.echoes = 0
         self.pongs = 0
+        self.phase = 'idle'
+        self.halt = threading.Event()
+        self.spam_thread = None
+        self.joined_at = 0
+        self._left_noted = False
 
 
-def probe_chat(session, info, opts, chat_id):
+def probe_chat(session, info, opts, chat_id, timeout=30):
     """Call chat.getParticipants to inspect what the backend knows about a
     chat id (looking for the room instance id / activity)."""
     url = '%s://%s%s' % (opts.chat_scheme, opts.chat_host, opts.chat_endpoint)
@@ -402,7 +460,7 @@ def probe_chat(session, info, opts, chat_id):
     auth = (cid, info.get('clientSessionId', ''), info.get('securityKey', ''))
     args = {'userId': cid, 'chatId': int(chat_id)}
     return xmlrpc_call(url, 'chat.getParticipants', (args,), auth=auth,
-                       insecure=opts.insecure)
+                       insecure=opts.insecure, timeout=timeout)
 
 
 def find_rooms(session, info, opts, keywords):
@@ -498,8 +556,63 @@ def login(session, opts):
     return info
 
 
+def imq_connect_args(opts, info):
+    host = opts.imq_host or (info or {}).get('imq_gateway_secure_host')
+    if not host:
+        raise BackendError('no IMQ host: pass --imq-host')
+    cookie = (info or {}).get('imq_cookie', '')
+    token = (info or {}).get('imq_auth_token', '')
+    if isinstance(cookie, str):
+        cookie = cookie.encode('utf-8')
+    if isinstance(token, str):
+        token = token.encode('utf-8')
+    return host, cookie, token
+
+
+def connect_user_imq(session, opts, info=None):
+    """Open IMQ with current login bits and subscribe /user/<cid>."""
+    info = info if info is not None else session.info
+    host, cookie, token = imq_connect_args(opts, info)
+    session.imq = ImqClient(host, opts.imq_port, not opts.imq_plain,
+                            opts.insecure)
+    session.imq.debug_frames = opts.debug_frames
+    t0 = time.time()
+    session.imq.connect(str(session.cid), cookie, token)
+    session.imq_ms = (time.time() - t0) * 1000
+    user_queue = '/user/%s' % session.cid
+    session.imq.subscribe(user_queue)
+    log(session, 'IMQ ok (%d ms)  sub %s' % (session.imq_ms, user_queue),
+        verbose=True)
+    return session.imq
+
+
 def chat_url(opts):
     return '%s://%s%s' % (opts.chat_scheme, opts.chat_host, opts.chat_endpoint)
+
+
+def session_ping(session, opts):
+    """XML-RPC session keepalive; the real client calls this every 110s."""
+    url = '%s://%s/api/xmlrpc/client.php' % (opts.service_scheme, opts.service_host)
+    auth = chat_auth(session, session.info)
+    args = {'userId': session.cid, 'error_logs': []}
+    return xmlrpc_call(url, 'ping', (args,), auth=auth, insecure=opts.insecure)
+
+
+def session_ping_loop(session, opts, stop_event):
+    while not stop_event.is_set():
+        if stop_event.wait(110):
+            return
+        try:
+            session_ping(session, opts)
+        except Exception:
+            pass
+
+
+def start_session_ping(session, opts, stop_event):
+    t = threading.Thread(target=session_ping_loop,
+                         args=(session, opts, stop_event), daemon=True)
+    t.start()
+    return t
 
 
 def chat_auth(session, info):
@@ -548,72 +661,1125 @@ def get_or_make_chat(session, info, opts, invite=None):
     return detect_key(result, CHATID_KEYS, opts.chatid_key, 'chat id')
 
 
+# Romanian joiners only. No first/second person (eu, tu, îmi, mă, te…).
+# Seed if unions.txt is missing; edit the file or the TUI after that.
+DEFAULT_UNIONS = (
+    'și', 'de', 'la', 'pe', 'cu', 'din', 'în', 'un', 'o', 'că',
+    'sau', 'dar', 'ca', 'pentru', 'după', 'fără', 'până', 'când',
+    'unde', 'cum', 'dacă', 'decât', 'între', 'spre', 'prin', 'despre',
+    'sub', 'peste', 'lângă', 'către', 'ori', 'nici', 'doar', 'mai',
+    'foarte', 'așa', 'cât', 'ce', 'care', 'tot', 'alt', 'plus',
+)
+_SKIP_UNIONS = set((
+    'eu', 'mie', 'meu', 'mea', 'mine', 'imi', 'îmi', 'ma', 'mă',
+    'tu', 'tau', 'tău', 'ta', 'tine', 'tie', 'ție', 'iti', 'îți',
+    'te', 'me', 'mi', 'se', 'yo', 'su', 'como',
+))
+
+
+def parse_wordlist_text(text):
+    """Each non-empty line is one word or token."""
+    lines = []
+    for raw in str(text or '').splitlines():
+        line = raw.strip().strip('\r')
+        if line and not line.startswith('#'):
+            lines.append(line)
+    return lines
+
+
 def load_wordlist(path):
-    words = []
     with open(path, 'r', encoding='utf-8') as f:
-        for line in f:
-            w = line.strip()
-            if w:
-                words.append(w)
-    if not words:
+        lines = parse_wordlist_text(f.read())
+    if not lines:
         raise BackendError('wordlist %s is empty' % path)
+    return lines
+
+
+def save_wordlist(path, text):
+    lines = parse_wordlist_text(text)
+    if not lines:
+        raise BackendError('wordlist is empty')
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(lines) + '\n')
+    return lines
+
+
+def unions_path(wordlist_path):
+    folder = os.path.dirname(os.path.abspath(wordlist_path or ''))
+    return os.path.join(folder or '.', 'unions.txt')
+
+
+def clean_unions(words):
+    out = []
+    seen = set()
+    for raw in words or []:
+        word = (raw or '').strip()
+        if not word:
+            continue
+        key = word.lower()
+        if key in _SKIP_UNIONS or key in seen:
+            continue
+        seen.add(key)
+        out.append(word)
+    return out or list(DEFAULT_UNIONS)
+
+
+def load_unions(path):
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            words = clean_unions(parse_wordlist_text(f.read()))
+        if words:
+            return words
+    except Exception:
+        pass
+    return list(DEFAULT_UNIONS)
+
+
+def save_unions(path, text):
+    words = clean_unions(parse_wordlist_text(text))
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(words) + '\n')
     return words
 
 
+def ensure_unions_file(path):
+    if os.path.isfile(path):
+        return
+    try:
+        save_unions(path, '\n'.join(DEFAULT_UNIONS))
+    except Exception:
+        pass
+
+
+def next_union(opts, unions):
+    """Walk the union list in order so every joiner gets used."""
+    idx = int(getattr(opts, 'union_index', 0) or 0)
+    word = unions[idx % len(unions)]
+    opts.union_index = idx + 1
+    return word
+
+
+def build_spam_phrase(opts):
+    """Keyword + Romanian union + keyword: every phrase uses at least one union."""
+    words = getattr(opts, 'spam_words', None) or [getattr(opts, 'message', 'hola')]
+    unions = clean_unions(getattr(opts, 'union_words', None))
+    if not unions:
+        path = getattr(opts, 'unions', None) or unions_path(
+            getattr(opts, 'wordlist', None))
+        unions = load_unions(path)
+        opts.union_words = unions
+    n = random.randint(2, 4)
+    parts = [random.choice(words)]
+    for _ in range(n - 1):
+        parts.append(next_union(opts, unions))
+        parts.append(random.choice(words))
+    return ' '.join(parts)
+
+
+def _spam_bank(session, opts, items):
+    if not items:
+        items = [getattr(opts, 'message', 'hola')]
+    idx = getattr(session, 'spam_index', None)
+    if idx is None:
+        idx = random.randrange(len(items)) if len(items) > 1 else 0
+    item = items[idx % len(items)]
+    session.spam_index = idx + 1
+    return item
+
+
+def next_spam_word(session, opts):
+    tokens = getattr(opts, 'spam_tokens', None)
+    if tokens is None:
+        tokens = []
+        for line in getattr(opts, 'spam_words', None) or []:
+            tokens.extend(str(line).split())
+        opts.spam_tokens = tokens
+    return _spam_bank(session, opts, tokens)
+
+
+def next_spam_raw(session, opts):
+    return _spam_bank(
+        session, opts,
+        getattr(opts, 'spam_words', None) or [getattr(opts, 'message', 'hola')])
+
+
+def next_spam_line(session, opts):
+    style = getattr(opts, 'spam_style', 'phrase') or 'phrase'
+    if style == 'word':
+        return next_spam_word(session, opts)
+    if style == 'raw':
+        return next_spam_raw(session, opts)
+    return build_spam_phrase(opts)
+
+
+def session_halted(session, stop_event=None):
+    if stop_event is not None and stop_event.is_set():
+        return True
+    halt = getattr(session, 'halt', None)
+    return halt is not None and halt.is_set()
+
+
+def halt_session(session, opts):
+    if session.halt is None:
+        session.halt = threading.Event()
+    session.halt.set()
+    drop_imq(session, opts)
+    session.phase = 'down'
+    log(session, 'disconnected')
+
+
+def imq_alive(session):
+    imq = getattr(session, 'imq', None)
+    return bool(imq and not imq.closed_by_server and imq.sock is not None)
+
+
+def spam_loop_alive(session):
+    stop = getattr(session, 'spam_stop', None)
+    if stop is None or stop.is_set():
+        return False
+    thread = getattr(session, 'spam_thread', None)
+    if thread is not None and not thread.is_alive():
+        return False
+    return True
+
+
+def still_in_chat(session):
+    if session.halt is not None and session.halt.is_set():
+        return False
+    if getattr(session, '_left_noted', False):
+        return False
+    if not session.chat_id:
+        return False
+    if (session.phase or 'idle') not in ('in-room', 'spam'):
+        return False
+    return imq_alive(session)
+
+
+def can_accept_invite(session):
+    if session.halt is not None and session.halt.is_set():
+        return False
+    if not session.cid or still_in_chat(session):
+        return False
+    if getattr(session, '_joining', False):
+        return False
+    return imq_alive(session)
+
+
+def session_offline(session):
+    """Has a cid but IMQ is dead — cannot receive invites or chat."""
+    if session.halt is not None and session.halt.is_set():
+        return False
+    if (session.phase or '') == 'login':
+        return False
+    if not session.cid:
+        return False
+    return not imq_alive(session)
+
+
+def _phase_if_not_in_room(session):
+    return 'idle' if imq_alive(session) else 'down'
+
+
+def effective_phase(session):
+    """What the TUI should show right now, even if phase was not updated yet."""
+    if session.halt is not None and session.halt.is_set():
+        return 'down'
+    phase = session.phase or 'idle'
+    if phase == 'login':
+        return 'login'
+    if phase in ('in-room', 'spam') and still_in_chat(session):
+        if phase == 'spam' and not spam_loop_alive(session):
+            return 'in-room'
+        return phase
+    return _phase_if_not_in_room(session)
+
+
+def wait_for_invite(session, opts, reason=None):
+    """Idle + listen for a new invite so the agent can be pulled back in."""
+    if session.halt is not None and session.halt.is_set():
+        return
+    if session.spam_stop is not None:
+        session.spam_stop.set()
+        session.spam_stop = None
+    pool = getattr(opts, 'pool', None)
+    if pool:
+        pool.mark_left(session)
+    session._joining = False
+    session._left_noted = True
+    session.chat_id = None
+    if reason:
+        log(session, reason)
+    if not imq_alive(session) or not session.cid:
+        session.phase = 'down'
+        session.error = session.error or 'disconnected'
+        imq = session.imq
+        if imq:
+            imq.closed_by_server = True
+        log(session, 'offline  —  will relogin')
+        return
+    session.phase = 'idle'
+    session.error = None
+    bind_imq_session(session, opts, None)
+    log(session, 'waiting for invite')
+
+
+def note_left_room(session, opts, reason='left'):
+    """Bot is no longer in the chat. Flip status immediately."""
+    if session.halt is not None and session.halt.is_set():
+        return
+    was_in = session.phase in ('in-room', 'spam')
+    if getattr(session, '_left_noted', False) and not was_in:
+        return
+    if was_in:
+        lock = getattr(opts, 'stats_lock', None)
+        if lock is not None:
+            with lock:
+                opts.stats['left'] = opts.stats.get('left', 0) + 1
+    if getattr(opts, 'churn', False):
+        if session.spam_stop is not None:
+            session.spam_stop.set()
+            session.spam_stop = None
+        pool = getattr(opts, 'pool', None)
+        if pool:
+            pool.mark_left(session)
+        session._left_noted = True
+        session.chat_id = None
+        session.phase = _phase_if_not_in_room(session)
+        if was_in:
+            log(session, reason)
+        return
+    wait_for_invite(session, opts, reason if was_in else None)
+
+
+_LEAVE_WORDS = (
+    'leave', 'left', 'kick', 'kicked', 'eject', 'ejected',
+    'remove', 'removed', 'ban', 'banned', 'disconnect',
+    'disconnected', 'part', 'exit', 'quit', 'chatleave',
+    'leavechat', 'boot', 'booted', 'expel', 'expelled',
+    'evict', 'evicted', 'uninvite', 'sessionend', 'endchat',
+    'closechat', 'removedfrom', 'youwere',
+)
+
+
+def _token_norm(value):
+    return re.sub(r'[^a-z]', '', str(value).lower())
+
+
+def payload_says_self_left(session, queue, message_bytes):
+    cid = str(session.cid) if session.cid else ''
+    text = message_bytes.decode('utf-8', 'replace')
+    if queue.startswith('/user/'):
+        parts = text.split(' ', 1)
+        token = _token_norm(parts[0])
+        if any(word in token for word in _LEAVE_WORDS):
+            if len(parts) == 2:
+                try:
+                    info = json.loads(parts[1])
+                except ValueError:
+                    info = None
+                if isinstance(info, dict):
+                    other = (info.get('userId') or info.get('cid')
+                             or info.get('fromUserId'))
+                    if other and cid and str(other) != cid:
+                        return False
+            return True
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return False
+    if not isinstance(data, dict):
+        return False
+    who = data.get('userId') or data.get('cid') or data.get('fromUserId')
+    for key in ('leaving', 'isLeaving', 'left', 'kicked', 'removed',
+                'isKicked'):
+        if data.get(key) in (True, 1, '1', 'true', 'True'):
+            return (not who) or (not cid) or str(who) == cid
+    kind = ' '.join(str(data.get(key, '')) for key in (
+        'type', 'event', 'action', 'command', 'kind', 'name', 'msgType'))
+    kind_n = _token_norm(kind)
+    if kind_n and any(word in kind_n for word in _LEAVE_WORDS):
+        if who and cid and str(who) != cid:
+            return False
+        return True
+    reason = _token_norm(
+        str(data.get('reason') or '') + str(data.get('status') or ''))
+    if reason and any(word in reason for word in _LEAVE_WORDS):
+        return (not who) or (not cid) or str(who) == cid
+    msg = str(data.get('message') or '')
+    if msg.startswith('*') and any(
+            word in _token_norm(msg)
+            for word in ('leave', 'quit', 'exit', 'kick', 'boot', 'eject')):
+        return (not who) or (not cid) or str(who) == cid
+    return False
+
+
+def extract_participant_cids(result):
+    """CIDs still in the chat, or None if the payload cannot be read."""
+    if not isinstance(result, dict):
+        return None
+    found = set()
+
+    def take(value):
+        if value in (None, '', 0, '0'):
+            return
+        try:
+            if int(value) == 0:
+                return
+        except (TypeError, ValueError):
+            pass
+        found.add(str(value))
+
+    def from_entry(entry):
+        if isinstance(entry, dict):
+            for key in ('userId', 'user_id', 'cid', 'customer_id',
+                        'customerId'):
+                if key in entry:
+                    take(entry.get(key))
+                    return
+            if len(entry) == 1:
+                key, value = next(iter(entry.items()))
+                take(key)
+                if isinstance(value, dict):
+                    from_entry(value)
+        else:
+            take(entry)
+
+    blob = None
+    for key in ('participants', 'users', 'userIds', 'members'):
+        if key in result:
+            blob = result.get(key)
+            break
+    if blob is None:
+        return None
+    if isinstance(blob, dict):
+        for key, value in blob.items():
+            take(key)
+            from_entry(value)
+    elif isinstance(blob, (list, tuple)):
+        for item in blob:
+            from_entry(item)
+    else:
+        take(blob)
+    return found
+
+
+def mark_joined_room(session):
+    session._left_noted = False
+    session.joined_at = time.time()
+    session.phase = 'in-room'
+
+
+def bind_imq_session(session, opts, chat_queue=None):
+    imq = session.imq
+    if not imq:
+        return
+    imq.on_message = make_imq_handler(session, opts, chat_queue)
+    imq.on_close = lambda: note_left_room(session, opts, 'left')
+    # XML-RPC session keepalive (the real client pings every 110s); without it
+    # the server considers the session dead and drops us from the room.
+    if not getattr(session, '_session_ping_started', False):
+        session._session_ping_started = True
+        start_session_ping(session, opts, opts.stop_event)
+
+
+def relogin_session(session, opts):
+    lock = getattr(session, '_relogin_lock', None)
+    if lock is None:
+        lock = threading.Lock()
+        session._relogin_lock = lock
+    if not lock.acquire(False):
+        return False
+    session.phase = 'login'
+    log(session, 'relogin')
+    try:
+        info = login(session, opts)
+        session.info = info
+        session.cid = detect_key(info, CID_KEYS, opts.cid_key, 'customer id')
+        session.error = None
+        session.phase = 'login' if not imq_alive(session) else 'idle'
+        log(session, 'online')
+        return True
+    except Exception as e:
+        session.error = str(e)
+        session.phase = 'down'
+        log(session, 'relogin failed: %s' % e)
+        return False
+    finally:
+        lock.release()
+
+
+def accept_invite_or_relogin(session, opts, chat_id, invite_id, location):
+    """Accept; on failure login again and retry once. Then idle."""
+    try:
+        accept_invite(session, opts, chat_id, invite_id, location)
+        return True
+    except Exception as e:
+        log(session, 'accept failed: %s' % e)
+        if room_full_error(e):
+            if imq_alive(session):
+                session.phase = 'idle'
+                bind_imq_session(session, opts, None)
+                log(session, 'room full  —  waiting')
+            else:
+                wait_for_invite(session, opts, 'room full')
+            return False
+    if not relogin_session(session, opts):
+        wait_for_invite(session, opts)
+        return False
+    log(session, 'retry accept')
+    try:
+        accept_invite(session, opts, chat_id, invite_id, location)
+        return True
+    except Exception as e:
+        wait_for_invite(session, opts, 'accept failed after relogin: %s' % e)
+        return False
+
+
+def try_handle_invite(session, opts, queue, message_bytes):
+    if still_in_chat(session):
+        return False
+    if getattr(session, '_joining', False):
+        return False
+    text = message_bytes.decode('utf-8', 'replace')
+    if opts.debug_frames:
+        log(session, 'user-queue msg on %s: %r' % (queue, text[:200]))
+    parts = text.split(' ', 1)
+    if len(parts) != 2:
+        return False
+    token, payload = parts
+    if 'chatinvite' not in token.lower():
+        return False
+    try:
+        info = json.loads(payload)
+    except ValueError:
+        return False
+    if not isinstance(info, dict):
+        return False
+    chat_id = info.get('chatId')
+    invite_id = info.get('inviteId')
+    location = info.get('location')
+    if not chat_id or not invite_id:
+        return False
+    log(session, 'invite from %s, joining' % info.get('inviter'))
+    session._joining = True
+    lock = invite_join_lock(opts)
+    lock.acquire()
+    try:
+        if not accept_invite_or_relogin(
+                session, opts, chat_id, invite_id, location):
+            return True
+        session.chat_id = chat_id
+        chat_queue = chat_queue_name(chat_id)
+        try:
+            subscribe_after_accept(session, chat_queue, tries=4, gap=1.0)
+        except Exception as e:
+            missing = session_missing_from_chat(session, opts)
+            why = ('room full  —  not seated, waiting' if missing
+                   else 'subscribe after accept failed: %s' % e)
+            if imq_alive(session):
+                log(session, why)
+                session.chat_id = None
+                session.phase = 'idle'
+                bind_imq_session(session, opts, None)
+                if not missing:
+                    log(session, 'waiting for invite')
+            else:
+                wait_for_invite(session, opts, why)
+            return True
+        with opts.stats_lock:
+            opts.stats['joined'] += 1
+        log(session, 'in room')
+        mark_joined_room(session)
+        arm_trigger(session, opts, chat_queue)
+        time.sleep(0.25)
+        return True
+    finally:
+        session._joining = False
+        lock.release()
+
+
+def invite_session_dead(err):
+    text = str(err).lower()
+    needles = (
+        'session', 'auth', 'login', 'disconnect', 'closed',
+        'not connected', 'timed out', 'timeout', 'broken pipe',
+        'reset', 'eof', '401', '403', 'invalid key', 'security',
+    )
+    for needle in needles:
+        if needle in text:
+            return True
+    return False
+
+
+def mark_invite_dead(session, opts, reason):
+    session.error = reason
+    session.chat_id = None
+    session._left_noted = True
+    session._joining = False
+    session.phase = 'down'
+    log(session, reason)
+    imq = session.imq
+    if imq:
+        imq.closed_by_server = True
+
+
+def looks_like_cid(value):
+    if value is None:
+        return True
+    text = str(value).strip()
+    return (not text) or text.isdigit()
+
+
+def cid_name_store(opts):
+    store = getattr(opts, 'cid_names', None)
+    if store is None:
+        store = {}
+        opts.cid_names = store
+        opts.cid_names_lock = threading.Lock()
+        opts.cid_name_pending = set()
+    return store
+
+
+def remember_cid_name(opts, cid, name):
+    cid = '' if cid is None else str(cid)
+    name = (name or '').strip()
+    if not cid or looks_like_cid(name):
+        return
+    store = cid_name_store(opts)
+    lock = getattr(opts, 'cid_names_lock', None)
+    if lock:
+        with lock:
+            store[cid] = name
+    else:
+        store[cid] = name
+    for session in getattr(opts, 'sessions', None) or []:
+        chat_lock = getattr(session, 'chat_lock', None)
+        lines = getattr(session, 'chat_log', None)
+        if not lines:
+            continue
+        if chat_lock is None:
+            for item in lines:
+                if str(item.get('sender')) == cid:
+                    item['name'] = name
+            continue
+        with chat_lock:
+            for item in lines:
+                if str(item.get('sender')) == cid:
+                    item['name'] = name
+
+
+def name_for_cid(opts, cid, fallback=''):
+    cid = '' if cid is None else str(cid)
+    if not cid:
+        return fallback or '?'
+    for session in getattr(opts, 'sessions', None) or []:
+        if session.cid is not None and str(session.cid) == cid:
+            remember_cid_name(opts, cid, session.username)
+            return session.username
+    store = cid_name_store(opts)
+    cached = store.get(cid)
+    if cached:
+        return cached
+    if fallback and not looks_like_cid(fallback):
+        remember_cid_name(opts, cid, fallback)
+        return fallback
+    return fallback or cid
+
+
+def fetch_avatar_name(session, opts, cid):
+    """Same endpoint the client avatar card uses: /api/avatarcard.php."""
+    cid = str(cid)
+    info = getattr(session, 'info', None) or {}
+    viewer = session.cid
+    if not viewer or not info.get('securityKey'):
+        return None
+    query = urllib.parse.urlencode({'cid': cid, 'viewer_cid': viewer})
+    url = '%s://%s/api/avatarcard.php?%s' % (
+        opts.service_scheme, opts.service_host, query)
+    key = info.get('securityKey', '')
+    headers = {
+        'User-Agent': 'IMVU Client',
+        'X-imvu-userid': str(viewer),
+        'X-imvu-csid': str(info.get('clientSessionId', '')),
+        'X-imvu-auth': hashlib.md5(
+            str(viewer).encode('utf-8') + str(key).encode('utf-8')
+            + query.encode('utf-8')).hexdigest(),
+    }
+    req = urllib.request.Request(url, headers=headers)
+    context = insecure_context(opts)
+    try:
+        with urllib.request.urlopen(req, timeout=15, context=context) as resp:
+            raw = resp.read().decode('utf-8', 'replace')
+        data = json.loads(raw)
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    name = (data.get('avatarName') or data.get('avname')
+            or data.get('avatar_name') or data.get('name'))
+    if looks_like_cid(name):
+        return None
+    if data.get('isGuest') or data.get('guest') or data.get('is_guest'):
+        if not str(name).lower().startswith('guest_'):
+            name = 'Guest_%s' % name
+    return name
+
+
+def request_avatar_name(session, opts, cid):
+    cid = '' if cid is None else str(cid)
+    if not cid:
+        return
+    if not looks_like_cid(name_for_cid(opts, cid)):
+        return
+    store = cid_name_store(opts)
+    pending = opts.cid_name_pending
+    lock = opts.cid_names_lock
+    with lock:
+        if cid in store or cid in pending:
+            return
+        pending.add(cid)
+
+    def worker():
+        try:
+            name = fetch_avatar_name(session, opts, cid)
+            if name:
+                remember_cid_name(opts, cid, name)
+        finally:
+            with lock:
+                pending.discard(cid)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def harvest_participant_names(result, opts):
+    if not isinstance(result, dict):
+        return
+
+    def walk(node):
+        if isinstance(node, dict):
+            cid = (node.get('userId') or node.get('user_id')
+                   or node.get('cid') or node.get('customer_id')
+                   or node.get('customerId'))
+            name = None
+            for key in ('avatarName', 'avatarname', 'avname', 'avatar_name',
+                        'who', 'name', 'userName', 'username',
+                        'customers_name'):
+                value = node.get(key)
+                if value and not looks_like_cid(value):
+                    name = value
+                    break
+            if cid and name:
+                remember_cid_name(opts, cid, name)
+            for key, value in node.items():
+                if str(key).isdigit() and isinstance(value, dict):
+                    nested = dict(value)
+                    nested.setdefault('cid', key)
+                    walk(nested)
+                else:
+                    walk(value)
+        elif isinstance(node, (list, tuple)):
+            for item in node:
+                walk(item)
+
+    walk(result)
+
+
+def parse_chat_payload(message_bytes):
+    try:
+        data = json.loads(message_bytes.decode('utf-8', 'replace'))
+    except ValueError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    return data
+
+
+def record_chat_message(session, sender, name, text, to=0):
+    text = (text or '').strip()
+    if not text:
+        return
+    now = time.time()
+    sender = '' if sender is None else str(sender)
+    if getattr(session, 'chat_lock', None) is None:
+        session.chat_lock = threading.Lock()
+        session.chat_log = []
+        session.chat_seq = 0
+    with session.chat_lock:
+        log_lines = session.chat_log
+        if log_lines:
+            last = log_lines[-1]
+            if (last.get('sender') == sender
+                    and last.get('text') == text
+                    and now - last.get('ts', 0) < 0.4):
+                return
+        session.chat_seq += 1
+        log_lines.append({
+            'seq': session.chat_seq,
+            'ts': now,
+            'sender': sender,
+            'name': name or sender or '?',
+            'text': text,
+            'to': to or 0,
+        })
+        del log_lines[:-400]
+
+
+def record_incoming_chat(session, opts, queue, message_bytes):
+    if not queue.startswith('/chat/'):
+        return
+    data = parse_chat_payload(message_bytes)
+    if not data:
+        return
+    text = str(data.get('message') or '').strip()
+    if not text or text.startswith('*'):
+        return
+    sender = data.get('userId') or data.get('cid')
+    name = (data.get('avatarName') or data.get('avatarname')
+            or data.get('who') or data.get('name')
+            or data.get('userName') or data.get('username'))
+    resolved = name_for_cid(opts, sender, name)
+    record_chat_message(session, sender, resolved, text, data.get('to') or 0)
+    if looks_like_cid(resolved):
+        request_avatar_name(session, opts, sender)
+    dest = data.get('to') or 0
+    if dest and looks_like_cid(name_for_cid(opts, dest)):
+        request_avatar_name(session, opts, dest)
+
+
+def send_manual_chat(session, opts, text, to=0):
+    text = (text or '').strip()
+    if not text:
+        return 'empty'
+    if session_halted(session) or not imq_alive(session) or not session.chat_id:
+        return 'not in room'
+    try:
+        to_cid = int(to or 0)
+    except (TypeError, ValueError):
+        to_cid = 0
+    queue = chat_queue_name(session.chat_id)
+    payload = json.dumps({
+        'userId': session.cid,
+        'chatId': session.chat_id,
+        'message': text,
+        'to': to_cid,
+    }).encode('utf-8')
+    try:
+        session.imq.send_chat(queue, payload)
+        session.sent += 1
+        with opts.stats_lock:
+            opts.stats['sent'] += 1
+    except Exception as e:
+        return str(e)
+    record_chat_message(session, session.cid, session.username, text, to_cid)
+    return None
+
+
+def make_imq_handler(session, opts, chat_queue=None):
+    trigger = (make_trigger_handler(session, opts, chat_queue)
+               if chat_queue else None)
+
+    def on_message(user_id, q, message_bytes):
+        record_incoming_chat(session, opts, q, message_bytes)
+        if payload_says_self_left(session, q, message_bytes):
+            note_left_room(session, opts, 'left')
+            return
+        if try_handle_invite(session, opts, q, message_bytes):
+            return
+        if trigger:
+            trigger(user_id, q, message_bytes)
+
+    return on_message
+
+
+def reconcile_session(session, opts):
+    """If IMQ or the spam thread died, do not keep showing in-room/spam."""
+    if session.halt is not None and session.halt.is_set():
+        return
+    if (session.phase or '') == 'login':
+        return
+    if getattr(session, '_left_noted', False) or not session.chat_id:
+        if session.phase in ('in-room', 'spam', 'idle', 'down'):
+            session.phase = _phase_if_not_in_room(session)
+        return
+    phase = session.phase
+    if phase not in ('in-room', 'spam'):
+        if phase in ('idle', 'down'):
+            session.phase = _phase_if_not_in_room(session)
+        return
+    if not imq_alive(session):
+        note_left_room(session, opts, 'left')
+        return
+    if phase == 'spam' and not spam_loop_alive(session):
+        session.phase = 'in-room'
+
+
+def room_full_error(err):
+    text = str(err).lower()
+    needles = (
+        'full', 'too many', 'maximum', 'capacity', 'no seat',
+        'no room', 'occupancy', 'over the limit', 'room is full',
+    )
+    for needle in needles:
+        if needle in text:
+            return True
+    return False
+
+
+def accept_method_missing(err):
+    text = str(err).lower()
+    needles = (
+        'unknown method', 'no such method', 'invalid method',
+        'not implemented', 'unimplemented',
+    )
+    for needle in needles:
+        if needle in text:
+            return True
+    return False
+
+
+def invite_join_lock(opts):
+    lock = getattr(opts, 'invite_join_lock', None)
+    if lock is None:
+        lock = threading.Lock()
+        opts.invite_join_lock = lock
+    return lock
+
+
+def not_in_chat_error(err):
+    text = str(err).lower()
+    needles = (
+        'not in', 'not a participant', 'no such chat', 'unknown chat',
+        'invalid chat', 'declined', 'kicked', 'removed', 'not found',
+        'left', '1012', '1006', '1008', '1010',
+    )
+    for needle in needles:
+        if needle in text:
+            return True
+    return False
+
+
+def session_missing_from_chat(session, opts):
+    """True if this bot is no longer in the chat. None if we cannot tell."""
+    if not session.chat_id or not session.info or not session.cid:
+        return None
+    try:
+        result = probe_chat(session, session.info, opts, session.chat_id,
+                            timeout=8)
+    except Exception as e:
+        if not_in_chat_error(e):
+            return True
+        return None
+    harvest_participant_names(result, opts)
+    if isinstance(result, dict) and result.get('response') == 'declined':
+        return True
+    present = extract_participant_cids(result)
+    if present is None:
+        return None
+    return str(session.cid) not in present
+
+
+def presence_watch(opts, stop_event):
+    while not stop_event.wait(1.2):
+        sessions = getattr(opts, 'sessions', None) or []
+        for session in sessions:
+            if stop_event.is_set():
+                return
+            if session.halt is not None and session.halt.is_set():
+                continue
+            reconcile_session(session, opts)
+            if not still_in_chat(session):
+                continue
+            joined_at = getattr(session, 'joined_at', 0) or 0
+            if joined_at and (time.time() - joined_at) < 3:
+                continue
+            missing = session_missing_from_chat(session, opts)
+            if missing:
+                note_left_room(session, opts, 'kicked')
+
+
 def spam_wait(opts):
-    lo = getattr(opts, 'spam_delay', 0.3)
-    hi = getattr(opts, 'spam_delay_max', 0.5)
+    lo = getattr(opts, 'spam_delay', 0.4)
+    hi = getattr(opts, 'spam_delay_max', lo)
     if hi < lo:
         hi = lo
     return random.uniform(lo, hi)
 
 
+class SpamBeat(object):
+    """One clock for every bot so they send on the same tick, not in a queue."""
+
+    def __init__(self, interval):
+        self.interval = max(0.05, float(interval or 0.4))
+        self.cond = threading.Condition()
+        self.tick = 0
+        self.stop = threading.Event()
+
+    def run(self):
+        while not self.stop.is_set():
+            if self.stop.wait(self.interval):
+                break
+            with self.cond:
+                self.tick += 1
+                self.cond.notify_all()
+
+    def wait_tick(self, extra_stop=None):
+        with self.cond:
+            n = self.tick
+            while self.tick == n:
+                if self.stop.is_set():
+                    return False
+                if extra_stop is not None and extra_stop.is_set():
+                    return False
+                self.cond.wait(0.05)
+            return True
+
+
+def ensure_spam_beat(opts):
+    beat = getattr(opts, 'spam_beat', None)
+    if beat is not None and not beat.stop.is_set():
+        delay = max(0.05, float(getattr(opts, 'spam_delay', 0.4) or 0.4))
+        beat.interval = delay
+        return beat
+    beat = SpamBeat(getattr(opts, 'spam_delay', 0.4))
+    opts.spam_beat = beat
+    threading.Thread(target=beat.run, daemon=True).start()
+    return beat
+
+
+def start_spam_loop(session, opts, queue):
+    if session.spam_stop is not None and not session.spam_stop.is_set():
+        return
+    if opts.spam:
+        attach_word_banks(opts)
+    if getattr(opts, 'spam_rate_t0', None) is None:
+        mark_spam_rate_start(opts)
+    session.spam_stop = threading.Event()
+    t = threading.Thread(target=spam_loop,
+                         args=(session, opts, queue, session.spam_stop),
+                         daemon=True)
+    session.spam_thread = t
+    t.start()
+    session.phase = 'spam'
+    log(session, 'spam loop')
+
+
+def mark_spam_rate_start(opts):
+    stats = getattr(opts, 'stats', None) or {}
+    opts.spam_rate_t0 = time.time()
+    opts.spam_rate_sent0 = stats.get('sent', 0)
+    opts.spam_rate_frozen = None
+
+
+def mark_spam_rate_stop(opts):
+    if getattr(opts, 'spam_rate_frozen', None) is not None:
+        return
+    opts.spam_rate_frozen = spam_mps(opts)
+
+
+def spam_mps(opts):
+    frozen = getattr(opts, 'spam_rate_frozen', None)
+    if frozen is not None:
+        return frozen
+    t0 = getattr(opts, 'spam_rate_t0', None)
+    if not t0:
+        return 0.0
+    stats = getattr(opts, 'stats', None) or {}
+    sent = max(0, stats.get('sent', 0) - getattr(opts, 'spam_rate_sent0', 0))
+    dt = time.time() - t0
+    if dt < 0.2:
+        return 0.0
+    return sent / dt
+
+
+def start_spam_all(opts):
+    mark_spam_rate_start(opts)
+    if opts.spam:
+        attach_word_banks(opts)
+    for session in getattr(opts, 'sessions', None) or []:
+        if session_halted(session) or not still_in_chat(session):
+            continue
+        if not session.imq or not session.chat_id:
+            continue
+        start_spam_loop(session, opts, chat_queue_name(session.chat_id))
+
+
+def stop_spam_all(opts):
+    mark_spam_rate_stop(opts)
+    for session in getattr(opts, 'sessions', None) or []:
+        if session.spam_stop is not None and not session.spam_stop.is_set():
+            session.spam_stop.set()
+            if session.phase == 'spam' and still_in_chat(session):
+                session.phase = 'in-room'
+
+
 def spam_loop(session, opts, queue, stop):
-    while not stop.is_set():
-        imq = session.imq
-        if imq is None or imq.closed_by_server:
+    try:
+        while not stop.is_set() and not session_halted(session):
+            if stop.wait(spam_wait(opts)):
+                return
+            imq = session.imq
+            if imq is None or imq.closed_by_server:
+                note_left_room(session, opts, 'left')
+                return
+            if not session.chat_id:
+                note_left_room(session, opts, 'left')
+                return
+            line = next_spam_line(session, opts)
+            payload = json.dumps({
+                'userId': session.cid,
+                'chatId': session.chat_id,
+                'message': line,
+                'to': 0,
+            }).encode('utf-8')
+            try:
+                imq.send_chat(queue, payload)
+                session.sent += 1
+                with opts.stats_lock:
+                    opts.stats['sent'] += 1
+            except Exception:
+                note_left_room(session, opts, 'left')
+                return
+    finally:
+        if getattr(session, '_left_noted', False) or not session.chat_id:
+            if session.phase in ('in-room', 'spam'):
+                session.phase = _phase_if_not_in_room(session)
             return
-        word = random.choice(opts.spam_words)
-        payload = json.dumps({
-            'userId': session.cid,
-            'chatId': session.chat_id,
-            'message': word,
-            'to': 0,
-        }).encode('utf-8')
-        try:
-            imq.send_chat(queue, payload)
-            session.sent += 1
-            with opts.stats_lock:
-                opts.stats['sent'] += 1
-        except Exception:
-            return
-        stop.wait(spam_wait(opts))
+        if session.phase == 'spam':
+            if not imq_alive(session):
+                note_left_room(session, opts, 'left')
+            else:
+                session.phase = 'in-room'
 
 
 def make_trigger_handler(session, opts, queue):
-    trigger_re = re.compile(r'\b' + re.escape(opts.trigger) + r'\b',
-                            re.IGNORECASE)
+    trigger_re = (re.compile(r'\b' + re.escape(opts.trigger) + r'\b',
+                             re.IGNORECASE)
+                  if opts.trigger else None)
     stop_re = (re.compile(r'\b' + re.escape(opts.stop_trigger) + r'\b',
                           re.IGNORECASE)
                if opts.stop_trigger else None)
     watch = str(opts.trigger_from) if opts.trigger_from else None
 
     def start_spam():
-        if session.spam_stop is not None and not session.spam_stop.is_set():
+        now = time.monotonic()
+        if now - getattr(opts, '_last_go', 0) < 0.35:
+            start_spam_loop(session, opts, queue)
             return
-        session.spam_stop = threading.Event()
-        t = threading.Thread(target=spam_loop,
-                             args=(session, opts, queue, session.spam_stop),
-                             daemon=True)
-        t.start()
-        log(session, 'SPAM started (every %d-%d ms)' % (
-            int(opts.spam_delay * 1000),
-            int(getattr(opts, 'spam_delay_max', 0.5) * 1000)))
+        opts._last_go = now
+        log(session, 'got go')
+        start_spam_all(opts)
 
     def stop_spam():
-        if session.spam_stop is not None and not session.spam_stop.is_set():
-            session.spam_stop.set()
-            log(session, 'SPAM stopped')
+        now = time.monotonic()
+        if now - getattr(opts, '_last_stop', 0) < 0.35:
+            if session.spam_stop is not None and not session.spam_stop.is_set():
+                session.spam_stop.set()
+                if session.phase == 'spam' and still_in_chat(session):
+                    session.phase = 'in-room'
+            return
+        opts._last_stop = now
+        log(session, 'got stop')
+        stop_spam_all(opts)
 
     def on_message(user_id, q, message_bytes):
         try:
@@ -634,10 +1800,10 @@ def make_trigger_handler(session, opts, queue):
             if stop_re and stop_re.search(text):
                 stop_spam()
                 return
-            if trigger_re.search(text):
+            if trigger_re and trigger_re.search(text):
                 start_spam()
             return
-        if not trigger_re.search(text):
+        if not trigger_re or not trigger_re.search(text):
             return
         payload = json.dumps({
             'userId': session.cid,
@@ -665,10 +1831,12 @@ def chat_queue_name(chat_id):
     return queue
 
 
-def pick_word(opts):
+def pick_word(opts, session=None):
+    if getattr(opts, 'spam_words', None) and session is not None:
+        return next_spam_line(session, opts)
     words = getattr(opts, 'spam_words', None)
     if words:
-        return random.choice(words)
+        return words[0]
     return opts.message
 
 
@@ -733,15 +1901,14 @@ def resolve_invite(session, opts, stop_event):
     pool = getattr(opts, 'pool', None)
     if not pool or getattr(opts, 'no_invite', False):
         return None
-    while not (stop_event and stop_event.is_set()):
+    while not session_halted(session, stop_event):
         if pool.claim_host(session):
-            log(session, 'joining as host (public room)')
+            log(session, 'entering room')
             return None
         if pool.host_ready.wait(timeout=5):
             inviter = pool.inviter(session)
             if inviter and inviter.chat_id:
-                log(session, 'joining via invite from %s (chat %s)'
-                    % (inviter.username, inviter.chat_id))
+                log(session, 'entering via %s' % inviter.username)
                 return (inviter.chat_id, inviter.cid)
         # host may have failed; loop and try to claim
     raise BackendError('stopped before join')
@@ -772,41 +1939,20 @@ def join_room(session, info, opts, stats_lock, stop_event=None):
                     retryable = invite and attempt + 1 < attempts and (
                         '1012' in err or 'Invite expired' in err)
                     if retryable:
-                        log(session, '%s — retry %d/%d same chat'
-                            % (err, attempt + 2, attempts))
+                        log(session, '%s — retry %d/%d'
+                            % (err, attempt + 2, attempts), verbose=True)
                         time.sleep(random.uniform(0.3, 0.51))
                         continue
                     raise
             if last_err:
                 raise last_err
-            log(session, 'chatId %s' % (session.chat_id,))
+            log(session, 'chatId %s' % (session.chat_id,), verbose=True)
 
-            imq_host = opts.imq_host or info.get('imq_gateway_secure_host')
-            if not imq_host:
-                raise BackendError('no IMQ host: pass --imq-host or use a login '
-                                   'response with imq_gateway_secure_host')
-            cookie = info.get('imq_cookie', '')
-            token = info.get('imq_auth_token', '')
-            if isinstance(cookie, str):
-                cookie = cookie.encode('utf-8')
-            if isinstance(token, str):
-                token = token.encode('utf-8')
-
-            t0 = time.time()
-            session.imq = ImqClient(imq_host, opts.imq_port, not opts.imq_plain,
-                                    opts.insecure)
-            session.imq.debug_frames = opts.debug_frames
-            session.imq.connect(str(session.cid), cookie, token)
-            session.imq_ms = (time.time() - t0) * 1000
-            log(session, 'IMQ authenticated (%d ms)' % session.imq_ms)
-
-            user_queue = '/user/%s' % session.cid
-            session.imq.subscribe(user_queue)
-            log(session, 'subscribed %s' % user_queue)
+            connect_user_imq(session, opts, info)
 
             queue = chat_queue_name(session.chat_id)
             session.imq.subscribe(queue)
-            log(session, 'subscribed %s' % queue)
+            log(session, 'sub %s' % queue, verbose=True)
 
             with stats_lock:
                 opts.stats['joined'] += 1
@@ -819,9 +1965,12 @@ def join_room(session, info, opts, stats_lock, stop_event=None):
                     'to': 0,
                 }).encode('utf-8')
                 session.imq.send_chat(queue, seat_payload)
-                log(session, 'sent seat announcement (seat %s)' % session.seat)
+                log(session, 'seat %s' % session.seat, verbose=True)
             if pool:
                 pool.mark_joined(session)
+            mark_joined_room(session)
+            bind_imq_session(session, opts, queue)
+            log(session, 'in room')
             return queue
     except Exception:
         if pool:
@@ -845,14 +1994,16 @@ def leave_room(session, opts, stats_lock):
         pool.mark_left(session)
     with stats_lock:
         opts.stats['left'] += 1
-    log(session, 'left room')
+    session.phase = 'down'
+    log(session, 'left')
 
 
 def send_words(session, opts, queue, count, stop_event, stats_lock):
     for i in range(count):
-        if stop_event.is_set() or not session.imq or session.imq.closed_by_server:
+        if (session_halted(session, stop_event)
+                or not session.imq or session.imq.closed_by_server):
             break
-        word = pick_word(opts)
+        word = pick_word(opts, session)
         payload = json.dumps({
             'userId': session.cid,
             'chatId': session.chat_id,
@@ -863,19 +2014,23 @@ def send_words(session, opts, queue, count, stop_event, stats_lock):
         session.sent += 1
         with stats_lock:
             opts.stats['sent'] += 1
-        log(session, 'sent %d/%d: %s' % (i + 1, count, word))
+        log(session, 'sent %d/%d: %s' % (i + 1, count, word), verbose=True)
         if i + 1 < count:
             time.sleep(random.uniform(0.3, 0.51))
 
 
 def run_churn(session, info, opts, stop_event, stats_lock):
     """Join -> send N words -> leave, then repeat until stop."""
-    while not stop_event.is_set():
+    while not session_halted(session, stop_event):
         try:
             queue = join_room(session, info, opts, stats_lock, stop_event)
+            if session_halted(session, stop_event):
+                break
+            arm_trigger(session, opts, queue)
             send_words(session, opts, queue, opts.repeat, stop_event, stats_lock)
-            if opts.hold > 0 and session.imq and not stop_event.is_set():
-                session.imq.run_until(stop_event, time.time() + opts.hold)
+            if opts.hold > 0 and session.imq and not session_halted(session, stop_event):
+                session.imq.run_until(stop_event, time.time() + opts.hold,
+                                      extra_stop=session.halt)
         except (BackendError, socket.error, ssl.SSLError) as e:
             session.error = str(e)
             log(session, 'ERROR: %s' % e)
@@ -885,9 +2040,42 @@ def run_churn(session, info, opts, stop_event, stats_lock):
         session.cycles += 1
         with stats_lock:
             opts.stats['cycles'] += 1
-        log(session, 'cycle %d done' % session.cycles)
+        log(session, 'cycle %d' % session.cycles, verbose=True)
         if stop_event.wait(opts.churn_delay):
             break
+
+
+def drop_imq(session, opts, count_leave=False):
+    """Tear down IMQ without treating it as an intentional leave."""
+    if session.spam_stop is not None:
+        session.spam_stop.set()
+        session.spam_stop = None
+    pool = getattr(opts, 'pool', None)
+    if session.imq:
+        session.echoes += session.imq.echoes
+        session.pongs += session.imq.pongs
+        try:
+            session.imq.close()
+        except Exception:
+            pass
+        session.imq = None
+    if pool:
+        pool.mark_left(session)
+    if count_leave:
+        with opts.stats_lock:
+            opts.stats['left'] += 1
+    session.phase = 'down'
+
+
+def arm_trigger(session, opts, queue):
+    if opts.spam:
+        attach_word_banks(opts)
+    bind_imq_session(session, opts, queue)
+    if opts.trigger or opts.stop_trigger:
+        log(session, 'listening', verbose=True)
+    if (opts.spam and not opts.churn
+            and (getattr(opts, 'spam_auto', False) or not opts.trigger)):
+        start_spam_loop(session, opts, queue)
 
 
 def run_account(session, opts, stop_event, stats_lock):
@@ -895,59 +2083,79 @@ def run_account(session, opts, stop_event, stats_lock):
         run_listen_invite(session, opts, stop_event, stats_lock)
         return
     try:
+        session.phase = 'login'
         t0 = time.time()
         info = login(session, opts)
         session.info = info
         session.login_ms = (time.time() - t0) * 1000
         session.cid = detect_key(info, CID_KEYS, opts.cid_key, 'customer id')
-        log(session, 'logged in as cid %s (%d ms)' % (session.cid, session.login_ms))
+        log(session, 'online')
 
-        if opts.churn and not opts.trigger:
+        if opts.churn:
             run_churn(session, info, opts, stop_event, stats_lock)
             return
 
-        queue = join_room(session, info, opts, stats_lock, stop_event)
-
-        if opts.trigger:
-            if opts.spam and not getattr(opts, 'spam_words', None):
-                opts.spam_words = load_wordlist(opts.wordlist)
-            session.imq.on_message = make_trigger_handler(session, opts, queue)
-            log(session, 'listening for %r from %s' % (
-                opts.trigger, opts.trigger_from or 'anyone'))
-        send_words(session, opts, queue,
-                   0 if opts.trigger else opts.repeat,
-                   stop_event, stats_lock)
-
-        deadline = (time.time() + opts.hold) if opts.hold > 0 else None
-        session.imq.run_until(stop_event, deadline)
-
-    except (BackendError, socket.error, ssl.SSLError) as e:
-        session.error = str(e)
-        log(session, 'ERROR: %s' % e)
-        with stats_lock:
-            opts.stats['errors'] += 1
+        while not session_halted(session, stop_event):
+            try:
+                queue = join_room(session, info, opts, stats_lock, stop_event)
+                if session_halted(session, stop_event):
+                    break
+                session.error = None
+                arm_trigger(session, opts, queue)
+                looping = (session.spam_stop is not None
+                           and not session.spam_stop.is_set())
+                send_words(session, opts, queue,
+                           0 if (looping or opts.trigger) else opts.repeat,
+                           stop_event, stats_lock)
+                deadline = (time.time() + opts.hold) if opts.hold > 0 else None
+                if session.imq:
+                    session.imq.run_until(stop_event, deadline,
+                                          extra_stop=session.halt)
+                reconcile_session(session, opts)
+            except (BackendError, socket.error, ssl.SSLError) as e:
+                if session_halted(session, stop_event):
+                    break
+                session.error = str(e)
+                session.phase = 'down'
+                log(session, 'ERROR: %s' % e)
+                with stats_lock:
+                    opts.stats['errors'] += 1
+            if session_halted(session, stop_event) or opts.hold > 0:
+                break
+            dropped = (session.imq is None or session.imq.closed_by_server
+                       or session.error)
+            if not dropped:
+                break
+            log(session, 'rejoining')
+            drop_imq(session, opts)
+            if not relogin_session(session, opts):
+                if stop_event.wait(2.0):
+                    break
+                continue
+            info = session.info
+            if stop_event.wait(0.4):
+                break
     finally:
-        if session.spam_stop is not None:
-            session.spam_stop.set()
-        if session.imq:
-            session.echoes += session.imq.echoes
-            session.pongs += session.imq.pongs
-            session.imq.close()
-            session.imq = None
+        drop_imq(session, opts, count_leave=False)
 
 
 _log_hook = None
+_log_verbose = False
 
 
-def log(session, text):
+def log(session, text, verbose=False):
+    if verbose and not _log_verbose:
+        return
     line = '[%s] %s' % (session.username, text)
-    print(line, flush=True)
     hook = _log_hook
     if hook:
         try:
             hook(line)
         except Exception:
             pass
+        if not _log_verbose:
+            return
+    print(line, flush=True)
 
 
 # --- main --------------------------------------------------------------------
@@ -983,16 +2191,25 @@ def main(argv=None):
                              '--stop-trigger stops it')
     parser.add_argument('--stop-trigger', default='st',
                         help='word that stops the spam (spam mode)')
-    parser.add_argument('--spam-delay', type=float, default=0.3,
-                        help='min seconds between spam messages (default 0.3)')
-    parser.add_argument('--spam-delay-max', type=float, default=0.5,
-                        help='max seconds between spam messages (default 0.5)')
+    parser.add_argument('--spam-delay', type=float, default=0.4,
+                        help='min seconds between spam messages (default 0.4)')
+    parser.add_argument('--spam-delay-max', type=float, default=0.4,
+                        help='max seconds between spam messages (default 0.4)')
     parser.add_argument('--wordlist',
                         default=os.path.join(here, 'wordlist.txt'),
-                        help='word list file for --spam (one word per line)')
+                        help='keywords file: one word per line, mixed into phrases')
+    parser.add_argument('--unions',
+                        default=os.path.join(here, 'unions.txt'),
+                        help='joining words (tu, como, de...) used between keywords')
+    parser.add_argument('--spam-style', choices=('phrase', 'word', 'raw'),
+                        default='phrase',
+                        help='phrase: mix with unions; word: one token; '
+                             'raw: each wordlist line as-is, no unions')
+    parser.add_argument('--spam-auto', action='store_true',
+                        help='start the wordlist loop immediately (no go word)')
     parser.add_argument('--trigger',
-                        help='listen mode: say --message when this word '
-                             'appears in chat (instead of sending on join)')
+                        help='word that starts the loop; omit with --spam-auto '
+                             'to send the wordlist on its own')
     parser.add_argument('--trigger-from',
                         help='only react to this sender cid (e.g. your main '
                              'account)')
@@ -1013,7 +2230,11 @@ def main(argv=None):
                         help='seconds to wait after leaving before rejoining '
                              '(default 1)')
     parser.add_argument('--gui', action='store_true',
-                        help='open a window with a Go button')
+                        help='open a desktop window')
+    parser.add_argument('--menu', action='store_true',
+                        help='open the terminal menu (default if no --room)')
+    parser.add_argument('--verbose', action='store_true',
+                        help='print every join/subscribe/send line')
     parser.add_argument('--no-invite', action='store_true',
                         help='do not have agents invite each other; each '
                              'joins the public room on its own')
@@ -1048,11 +2269,15 @@ def main(argv=None):
     opts = parser.parse_args(argv)
     if opts.host:
         opts.secure_host = opts.chat_host = opts.service_host = opts.host
-    if not opts.room and not opts.chat_id and not opts.find_room \
-            and not opts.probe_chat and not opts.listen_invite:
-        opts.gui = True
+    global _log_verbose
+    _log_verbose = bool(opts.verbose)
+    no_target = (not opts.room and not opts.chat_id and not opts.find_room
+                 and not opts.probe_chat and not opts.listen_invite)
     if opts.gui and not opts.find_room and not opts.probe_chat:
         return run_gui(opts)
+    if (opts.menu or no_target) and not opts.find_room and not opts.probe_chat:
+        from tui import run_tui
+        return run_tui(opts)
 
     return run_load(opts)
 
@@ -1067,12 +2292,23 @@ def prepare_run(opts):
     opts.ready_cids = []
     if opts.churn:
         opts.register = True
-        if not getattr(opts, 'spam_words', None):
-            try:
-                opts.spam_words = load_wordlist(opts.wordlist)
-            except Exception:
-                opts.spam_words = None
+    if getattr(opts, 'spam', False):
+        attach_word_banks(opts)
     return stats_lock, stop_event
+
+
+def attach_word_banks(opts):
+    if not getattr(opts, 'spam_words', None):
+        try:
+            opts.spam_words = load_wordlist(opts.wordlist)
+        except Exception:
+            opts.spam_words = [getattr(opts, 'message', 'hola')]
+    upath = getattr(opts, 'unions', None) or unions_path(
+        getattr(opts, 'wordlist', None))
+    opts.unions = upath
+    ensure_unions_file(upath)
+    if not getattr(opts, 'union_words', None):
+        opts.union_words = load_unions(upath)
 
 
 def run_load(opts):
@@ -1080,6 +2316,7 @@ def run_load(opts):
 
     accounts = load_accounts(opts.accounts, opts.count)
     opts.total_accounts = len(accounts)
+    opts.sessions = accounts
     if not accounts:
         print('no accounts in %s' % opts.accounts)
         return 1
@@ -1113,31 +2350,56 @@ def run_load(opts):
         print('pass --room <roomInstanceId> or --chat-id <chatId>')
         return 1
 
-    if opts.listen_invite:
-        target = 'listen-invite (waiting for invitations)'
-    else:
-        target = opts.room or ('chat ' + str(opts.chat_id))
-    mode = 'churn join/leave + %d words' % opts.repeat if opts.churn else (
-        'message %r x%d' % (opts.message, opts.repeat))
-    print('roomload: %d accounts -> %s, %s'
-          % (len(accounts), target, mode), flush=True)
+    if not getattr(opts, 'tui', False):
+        if opts.listen_invite:
+            target = 'listen-invite (waiting for invitations)'
+        else:
+            target = opts.room or ('chat ' + str(opts.chat_id))
+        mode = 'churn join/leave + %d words' % opts.repeat if opts.churn else (
+            'message %r x%d' % (opts.message, opts.repeat))
+        print('roomload: %d accounts -> %s, %s'
+              % (len(accounts), target, mode), flush=True)
 
     threads = []
+    workers = {}
     started = time.time()
+    watch = threading.Thread(target=presence_watch,
+                             args=(opts, stop_event), daemon=True)
+    watch.start()
+
+    def spawn_account(session):
+        thread = threading.Thread(
+            target=run_account,
+            args=(session, opts, stop_event, stats_lock),
+            daemon=True,
+        )
+        session.worker = thread
+        workers[session.username] = thread
+        threads.append(thread)
+        thread.start()
+        return thread
+
     try:
         for session in accounts:
-            thread = threading.Thread(
-                target=run_account,
-                args=(session, opts, stop_event, stats_lock),
-                daemon=True,
-            )
-            thread.start()
-            threads.append(thread)
+            spawn_account(session)
             if opts.ramp:
                 time.sleep(opts.ramp)
-        while any(t.is_alive() for t in threads):
+        while not stop_event.is_set():
             time.sleep(random.uniform(0.3, 0.51))
-            if stop_event.is_set():
+            any_alive = False
+            for session in accounts:
+                if session.halt.is_set():
+                    continue
+                worker = workers.get(session.username)
+                if worker is not None and worker.is_alive():
+                    any_alive = True
+                    continue
+                if not getattr(opts, 'tui', False):
+                    continue
+                log(session, 'restart')
+                spawn_account(session)
+                any_alive = True
+            if not any_alive:
                 break
         if stop_event.is_set():
             for t in threads:
@@ -1153,6 +2415,9 @@ def run_load(opts):
     failed = [s for s in accounts if s.error is not None]
     echoes = sum(s.echoes for s in accounts)
     pongs = sum(s.pongs for s in accounts)
+
+    if getattr(opts, 'tui', False):
+        return 0 if not failed else 2
 
     print('\n===== summary =====')
     print('elapsed:           %.1f s' % elapsed)
@@ -1319,10 +2584,21 @@ def accept_invite(session, opts, chat_id, invite_id, location):
     auth = chat_auth(session, session.info)
     args = {'userId': session.cid, 'inviteId': invite_id, 'chatId': chat_id}
     try:
-        return xmlrpc_call(url, 'chat.acceptInvite', (args,), auth=auth,
-                           insecure=opts.insecure)
-    except BackendError:
-        pass
+        result = xmlrpc_call(url, 'chat.acceptInvite', (args,), auth=auth,
+                             insecure=opts.insecure)
+    except BackendError as e:
+        if room_full_error(e):
+            raise BackendError('room full: %s' % e)
+        if not accept_method_missing(e):
+            log(session, 'acceptInvite failed: %s' % e, verbose=True)
+        result = None
+    else:
+        if isinstance(result, dict) and result.get('response') == 'declined':
+            reason = '%s %s' % (result.get('reason'), result.get('explanation'))
+            if room_full_error(reason):
+                raise BackendError('room full: %s' % reason.strip())
+            raise BackendError('accept declined: %s' % reason.strip())
+        return result
     args2 = {'userId': session.cid, 'version': opts.client_version,
              'publicroom': True, 'private': True}
     if chat_id:
@@ -1331,8 +2607,12 @@ def accept_invite(session, opts, chat_id, invite_id, location):
     if room:
         args2['activity'] = 'publicroom-%s' % room
         args2['private'] = False
-    return xmlrpc_call(url, 'chat.getOrMakeChat', (args2,), auth=auth,
-                       insecure=opts.insecure)
+    result = xmlrpc_call(url, 'chat.getOrMakeChat', (args2,), auth=auth,
+                         insecure=opts.insecure)
+    if isinstance(result, dict) and result.get('response') == 'declined':
+        reason = '%s %s' % (result.get('reason'), result.get('explanation'))
+        raise BackendError('join declined: %s' % reason.strip())
+    return result
 
 
 def room_from_location(location):
@@ -1351,97 +2631,89 @@ def room_from_location(location):
     return None
 
 
+def subscribe_after_accept(session, queue, tries=4, gap=1.0):
+    """Subscribe to the chat queue; retry so a busy or full room can catch up."""
+    last_err = None
+    for i in range(tries):
+        imq = session.imq
+        if imq is None or imq.closed_by_server:
+            raise last_err or BackendError('IMQ dropped during subscribe')
+        try:
+            imq.subscribe(queue, retries=2, wait=10.0)
+            return
+        except Exception as e:
+            last_err = e
+            if not imq_alive(session):
+                break
+            if i + 1 >= tries:
+                break
+            log(session, 'subscribe failed, retry %d/%d in %.0fs'
+                % (i + 2, tries, gap))
+            time.sleep(gap)
+            if imq_alive(session):
+                try:
+                    session.imq.ping()
+                except Exception:
+                    pass
+    raise last_err
+
+
 def make_invite_handler(session, opts):
-    def on_message(user_id, q, message_bytes):
-        text = message_bytes.decode('utf-8', 'replace')
-        if opts.debug_frames:
-            log(session, 'user-queue msg on %s: %r' % (q, text[:200]))
-        parts = text.split(' ', 1)
-        if len(parts) != 2:
-            return
-        token, payload = parts
-        if 'chatinvite' not in token.lower():
-            return
-        try:
-            info = json.loads(payload)
-        except ValueError:
-            return
-        if not isinstance(info, dict):
-            return
-        chat_id = info.get('chatId')
-        invite_id = info.get('inviteId')
-        location = info.get('location')
-        if not chat_id or not invite_id:
-            return
-        log(session, 'invited to chat %s by %s, accepting'
-            % (chat_id, info.get('inviter')))
-        try:
-            accept_invite(session, opts, chat_id, invite_id, location)
-        except Exception as e:
-            log(session, 'accept failed: %s' % e)
-            return
-        session.chat_id = chat_id
-        queue = '/chat/%s' % chat_id
-        try:
-            session.imq.subscribe(queue)
-        except Exception as e:
-            log(session, 'subscribe after accept failed: %s' % e)
-            return
-        with opts.stats_lock:
-            opts.stats['joined'] += 1
-        log(session, 'accepted and joined %s' % queue)
-        if opts.trigger:
-            if opts.spam and not getattr(opts, 'spam_words', None):
-                opts.spam_words = load_wordlist(opts.wordlist)
-            session.imq.on_message = make_trigger_handler(session, opts, queue)
-            log(session, 'in room; listening for trigger %r' % opts.trigger)
-    return on_message
+    return make_imq_handler(session, opts, None)
 
 
 def run_listen_invite(session, opts, stop_event, stats_lock):
     try:
+        session.phase = 'login'
         t0 = time.time()
         info = login(session, opts)
         session.info = info
         session.login_ms = (time.time() - t0) * 1000
         session.cid = detect_key(info, CID_KEYS, opts.cid_key, 'customer id')
-        log(session, 'ready as cid %s, waiting for invite' % session.cid)
+        log(session, 'waiting for invite')
         with stats_lock:
             opts.stats['ready'] = opts.stats.get('ready', 0) + 1
             opts.ready_cids.append(str(session.cid))
-            print('INVITE CIDS: ' + ','.join(opts.ready_cids), flush=True)
-            if len(opts.ready_cids) == getattr(opts, 'total_accounts', 0):
-                print('ALL READY - PASTE THIS IN THE PANEL: '
-                      + ','.join(opts.ready_cids), flush=True)
+            if not getattr(opts, 'tui', False):
+                print('INVITE CIDS: ' + ','.join(opts.ready_cids), flush=True)
 
-        imq_host = opts.imq_host or info.get('imq_gateway_secure_host')
-        if not imq_host:
-            raise BackendError('no IMQ host: pass --imq-host')
-        cookie = info.get('imq_cookie', '')
-        token = info.get('imq_auth_token', '')
-        if isinstance(cookie, str):
-            cookie = cookie.encode('utf-8')
-        if isinstance(token, str):
-            token = token.encode('utf-8')
-
-        session.imq = ImqClient(imq_host, opts.imq_port, not opts.imq_plain,
-                                opts.insecure)
-        session.imq.debug_frames = opts.debug_frames
-        session.imq.connect(str(session.cid), cookie, token)
-        user_queue = '/user/%s' % session.cid
-        session.imq.subscribe(user_queue)
-        session.imq.on_message = make_invite_handler(session, opts)
-        log(session, 'listening for invites on %s' % user_queue)
-        deadline = (time.time() + opts.hold) if opts.hold > 0 else None
-        session.imq.run_until(stop_event, deadline)
-    except (BackendError, socket.error, ssl.SSLError) as e:
-        session.error = str(e)
-        log(session, 'ERROR: %s' % e)
-        with stats_lock:
-            opts.stats['errors'] += 1
+        while not session_halted(session, stop_event):
+            try:
+                connect_user_imq(session, opts)
+                session.error = None
+                if session.phase not in ('in-room', 'spam'):
+                    session.phase = 'idle'
+                bind_imq_session(session, opts, (
+                    chat_queue_name(session.chat_id)
+                    if session.chat_id else None))
+                deadline = ((time.time() + opts.hold)
+                            if opts.hold > 0 else None)
+                session.imq.run_until(stop_event, deadline,
+                                      extra_stop=session.halt)
+            except (BackendError, socket.error, ssl.SSLError) as e:
+                if session_halted(session, stop_event):
+                    break
+                session.error = str(e)
+                session.phase = 'down'
+                log(session, 'ERROR: %s' % e)
+                with stats_lock:
+                    opts.stats['errors'] += 1
+            if session_halted(session, stop_event) or opts.hold > 0:
+                break
+            dropped = (session.imq is None or session.imq.closed_by_server
+                       or session.error)
+            if not dropped:
+                break
+            log(session, 'reconnecting')
+            drop_imq(session, opts)
+            if not relogin_session(session, opts):
+                if stop_event.wait(2.0):
+                    break
+                continue
+            if stop_event.wait(0.4):
+                break
     finally:
-        if session.imq:
-            session.imq.close()
+        drop_imq(session, opts, count_leave=False)
 
 
 if __name__ == '__main__':
