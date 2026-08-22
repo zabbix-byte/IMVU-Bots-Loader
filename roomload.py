@@ -18,12 +18,14 @@ for this purpose.
 
 import argparse
 import hashlib
+import http.client
 import json
 import os
 import re
 import random
 import socket
 import ssl
+import struct
 import sys
 import threading
 import time
@@ -155,7 +157,809 @@ class BackendError(Exception):
     pass
 
 
-def xmlrpc_call(url, method, params, auth=None, insecure=False, timeout=30):
+DEFAULT_PROXY_API = (
+    'https://api.proxyscrape.com/v2/?request=displayproxies'
+    '&protocol=socks5&timeout=15000&country=all'
+)
+PROXY_EXTRA_APIS = (
+    'https://api.proxyscrape.com/v2/?request=displayproxies'
+    '&protocol=http&timeout=15000&country=all',
+    'https://proxylist.geonode.com/api/proxy-list?protocols=socks5'
+    '&limit=500&sort_by=lastChecked&sort_type=desc',
+    'https://www.proxy-list.download/api/v1/get?type=socks5',
+    'https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt',
+    'https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt',
+    'https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt',
+)
+# IMVU drops extra clients from the same public IP after this many.
+PROXY_PER_IP = 8
+PROXY_RETRY = 6
+PROBE_XML = (
+    b'<?xml version="1.0"?>\n'
+    b'<methodCall><methodName>system.listMethods</methodName>'
+    b'<params></params></methodCall>'
+)
+
+
+class ProxySpec(object):
+    def __init__(self, host, port, kind='socks5'):
+        self.host = host
+        self.port = int(port)
+        self.kind = kind or 'socks5'
+
+    def key(self):
+        return '%s:%s' % (self.host, self.port)
+
+
+def proxy_ip(session):
+    px = getattr(session, 'proxy', None)
+    return px.host if px else ''
+
+
+def parse_proxy_line(line):
+    line = (line or '').strip()
+    if not line or line.startswith('#'):
+        return None
+    kind = 'socks5'
+    text = line
+    if '://' in text:
+        scheme, text = text.split('://', 1)
+        scheme = scheme.lower()
+        if scheme in ('http', 'https'):
+            kind = 'http'
+        elif 'socks' in scheme:
+            kind = 'socks5'
+        if '@' in text:
+            text = text.split('@', 1)[1]
+    text = text.split('/')[0].strip()
+    if text.count(':') < 1:
+        return None
+    host, port = text.rsplit(':', 1)
+    host = host.strip().strip('[]')
+    try:
+        port = int(port)
+    except ValueError:
+        return None
+    if not host or port <= 0:
+        return None
+    return ProxySpec(host, port, kind)
+
+
+def parse_proxy_text(text):
+    found = []
+    seen = set()
+    for line in (text or '').splitlines():
+        spec = parse_proxy_line(line)
+        if spec is None or spec.key() in seen:
+            continue
+        seen.add(spec.key())
+        found.append(spec)
+    return found
+
+
+def _json_proxy_kind(value):
+    if isinstance(value, (list, tuple)):
+        parts = [str(v).lower() for v in value]
+        if any('socks' in p for p in parts):
+            return 'socks5'
+        if any(p.startswith('http') for p in parts):
+            return 'http'
+        return 'socks5'
+    text = str(value or '').lower()
+    if 'socks' in text:
+        return 'socks5'
+    if 'http' in text:
+        return 'http'
+    return 'socks5'
+
+
+def spec_from_json_row(row):
+    if isinstance(row, str):
+        return parse_proxy_line(row)
+    if not isinstance(row, dict):
+        return None
+    host = row.get('ip') or row.get('host') or row.get('ipAddress')
+    port = row.get('port')
+    if host and port:
+        kind = _json_proxy_kind(
+            row.get('protocols') or row.get('protocol') or row.get('type'))
+        try:
+            return ProxySpec(str(host), int(port), kind)
+        except (TypeError, ValueError):
+            return None
+    return parse_proxy_line(row.get('proxy') or row.get('addr') or '')
+
+
+def parse_proxy_json(data):
+    rows = []
+    if isinstance(data, dict):
+        for key in ('data', 'proxies', 'list', 'result'):
+            if isinstance(data.get(key), list):
+                rows = data[key]
+                break
+        else:
+            rows = [data]
+    elif isinstance(data, list):
+        rows = data
+    found = []
+    seen = set()
+    for row in rows:
+        spec = spec_from_json_row(row)
+        if spec is None or spec.key() in seen:
+            continue
+        seen.add(spec.key())
+        found.append(spec)
+    return found
+
+
+def parse_proxy_payload(text):
+    text = (text or '').strip()
+    if not text:
+        return []
+    if text[:1] in '{[':
+        try:
+            return parse_proxy_json(json.loads(text))
+        except ValueError:
+            pass
+    return parse_proxy_text(text)
+
+
+def load_proxies_file(path):
+    if not path or not os.path.isfile(path):
+        return []
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            return parse_proxy_payload(f.read())
+    except Exception:
+        return []
+
+
+def fetch_proxy_api(url, timeout=20):
+    if not url:
+        return []
+    req = urllib.request.Request(
+        url, headers={'User-Agent': 'Mozilla/5.0 (compatible; roomload)'})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return parse_proxy_payload(resp.read().decode('utf-8', 'replace'))
+    except Exception as e:
+        raise BackendError('proxy api failed: %s' % e)
+
+
+def proxies_needed(n_accounts):
+    n = max(1, int(n_accounts or 1))
+    return (n + PROXY_PER_IP - 1) // PROXY_PER_IP
+
+
+def proxy_api_urls(opts):
+    api = (getattr(opts, 'proxy_api', None) or '').strip()
+    urls = []
+    if api and api != DEFAULT_PROXY_API:
+        urls.append(api)
+    urls.append(DEFAULT_PROXY_API)
+    for extra in PROXY_EXTRA_APIS:
+        if extra not in urls:
+            urls.append(extra)
+    return urls
+
+
+def collect_proxies_from_apis(opts, quiet=False):
+    found = []
+    for url in proxy_api_urls(opts):
+        try:
+            found.extend(fetch_proxy_api(url))
+        except Exception as e:
+            if not quiet:
+                _proxy_note(str(e))
+    return found
+
+
+def _recvn(sock, n):
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise BackendError('proxy closed')
+        buf.extend(chunk)
+    return bytes(buf)
+
+
+def socks5_connect(sock, dest_host, dest_port):
+    sock.sendall(b'\x05\x01\x00')
+    hello = _recvn(sock, 2)
+    if len(hello) < 2 or hello[0] != 5 or hello[1] != 0:
+        raise BackendError('socks5 auth rejected')
+    host_b = dest_host.encode('ascii')
+    req = (b'\x05\x01\x00\x03' + bytes([len(host_b)]) + host_b
+           + struct.pack('!H', int(dest_port)))
+    sock.sendall(req)
+    hdr = _recvn(sock, 4)
+    if hdr[1] != 0:
+        raise BackendError('socks5 connect failed %d' % hdr[1])
+    atyp = hdr[3]
+    if atyp == 1:
+        _recvn(sock, 6)
+    elif atyp == 3:
+        ln = _recvn(sock, 1)[0]
+        _recvn(sock, ln + 2)
+    elif atyp == 4:
+        _recvn(sock, 18)
+    else:
+        raise BackendError('socks5 bad atyp %d' % atyp)
+
+
+def http_connect(sock, dest_host, dest_port):
+    msg = ('CONNECT %s:%d HTTP/1.1\r\nHost: %s:%d\r\n\r\n'
+           % (dest_host, dest_port, dest_host, dest_port))
+    sock.sendall(msg.encode('ascii'))
+    buf = b''
+    while b'\r\n\r\n' not in buf:
+        chunk = sock.recv(4096)
+        if not chunk:
+            raise BackendError('proxy CONNECT closed')
+        buf += chunk
+        if len(buf) > 8192:
+            raise BackendError('proxy CONNECT too long')
+    status = buf.split(b'\r\n', 1)[0].decode('latin-1', 'replace')
+    if ' 200 ' not in status and not status.endswith(' 200'):
+        raise BackendError('proxy CONNECT %s' % status)
+
+
+def open_via_proxy(dest_host, dest_port, proxy, timeout=8.0):
+    raw = socket.create_connection((proxy.host, proxy.port), timeout=timeout)
+    raw.settimeout(timeout)
+    try:
+        if proxy.kind == 'http':
+            http_connect(raw, dest_host, dest_port)
+        else:
+            socks5_connect(raw, dest_host, dest_port)
+    except Exception:
+        try:
+            raw.close()
+        except Exception:
+            pass
+        raise
+    return raw
+
+
+def _http_status(chunk):
+    line = (chunk or b'').split(b'\r\n', 1)[0]
+    parts = line.split()
+    if len(parts) >= 2 and parts[1].isdigit():
+        return int(parts[1])
+    return 0
+
+
+def probe_proxy_tls(proxy, dest_host, dest_port, timeout=5.0):
+    sock = None
+    try:
+        sock = open_via_proxy(dest_host, dest_port, proxy, timeout)
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        tls = ctx.wrap_socket(sock, server_hostname=dest_host)
+        sock = tls
+        return True
+    except Exception:
+        return False
+    finally:
+        if sock:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+
+def probe_proxy(proxy, dest_host, dest_port, timeout=5.0,
+                path='/api/xmlrpc/client.php'):
+    """SOCKS/CONNECT + TLS + real POST to IMVU. HEAD-only lets junk through."""
+    sock = None
+    try:
+        sock = open_via_proxy(dest_host, dest_port, proxy, timeout)
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        tls = ctx.wrap_socket(sock, server_hostname=dest_host)
+        sock = tls
+        req = (
+            'POST %s HTTP/1.0\r\n'
+            'Host: %s\r\n'
+            'Content-Type: text/xml\r\n'
+            'Content-Length: %d\r\n'
+            'User-Agent: IMVU Client\r\n'
+            '\r\n'
+        ) % (path, dest_host, len(PROBE_XML))
+        tls.sendall(req.encode('ascii') + PROBE_XML)
+        chunk = b''
+        deadline = time.time() + timeout
+        while len(chunk) < 48 and time.time() < deadline:
+            tls.settimeout(max(0.2, deadline - time.time()))
+            part = tls.recv(256)
+            if not part:
+                break
+            chunk += part
+            if b'\r\n' in chunk:
+                break
+        status = _http_status(chunk)
+        if status in (502, 503, 504, 407, 0):
+            return False
+        return 200 <= status < 500
+    except Exception:
+        return False
+    finally:
+        if sock:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+
+def probe_proxy_imvu(proxy, login_host, login_path, imq_host=None,
+                     timeout=5.0):
+    if not probe_proxy(proxy, login_host, 443, timeout, path=login_path):
+        return False
+    if imq_host and imq_host != login_host:
+        if not probe_proxy_tls(proxy, imq_host, 443, timeout):
+            return False
+    return True
+
+
+def probe_proxies(proxies, want, check, workers=20):
+    live = []
+    lock = threading.Lock()
+    idx = [0]
+
+    def worker():
+        while True:
+            with lock:
+                if idx[0] >= len(proxies) or len(live) >= want:
+                    return
+                spec = proxies[idx[0]]
+                idx[0] += 1
+            if check(spec):
+                with lock:
+                    live.append(spec)
+
+    threads = []
+    n = min(workers, max(1, len(proxies)))
+    for _ in range(n):
+        t = threading.Thread(target=worker)
+        t.daemon = True
+        t.start()
+        threads.append(t)
+    for t in threads:
+        t.join()
+    return live
+
+
+def proxy_transport_error(err):
+    text = str(err).lower()
+    if 'fault ' in text or 'xml-rpc fault' in text:
+        return False
+    if 'no working prox' in text or 'none left' in text:
+        return False
+    needles = (
+        'timed out', 'timeout', 'socks', 'reset', 'eof',
+        'broken pipe', 'refused', 'unreachable', 'closed',
+        'tunnel', '407', '502', '503', '504', 'cannot reach',
+        'socks5', 'proxy connect', 'proxy closed', 'proxy dead',
+    )
+    for needle in needles:
+        if needle in text:
+            return True
+    return False
+
+
+class ProxyPool(object):
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.live = []
+        self.reserve = []
+        self.users = {}
+        self.bad = set()
+        self.seen = set()
+        self.fails = {}
+        self.assigned = {}
+        self.login_host = 'secure.imvu.com'
+        self.login_path = '/api/xmlrpc/client.php'
+        self.imq_host = None
+        self.probe_host = 'secure.imvu.com'
+        self.probe_port = 443
+        self.per_ip = PROXY_PER_IP
+        self.need = 1
+        self.want = 4
+        self.n_accounts = 0
+        self._stop = None
+        self._opts = None
+        self._hunter = None
+
+    def live_count(self):
+        with self.lock:
+            return len([p for p in self.live if p.key() not in self.bad])
+
+    def free_slots(self):
+        with self.lock:
+            n = 0
+            for spec in self.live:
+                if spec.key() in self.bad:
+                    continue
+                used = len(self.users.get(spec.key(), set()))
+                n += max(0, self.per_ip - used)
+            return n
+
+    def status_line(self):
+        live = self.live_count()
+        return '%d live · %d/ip · %d slots' % (
+            live, self.per_ip, live * self.per_ip)
+
+    def _unassign(self, username):
+        cur = self.assigned.pop(username, None)
+        if cur is None:
+            return cur
+        bucket = self.users.get(cur.key())
+        if bucket and username in bucket:
+            bucket.discard(username)
+        return cur
+
+    def _pick(self):
+        """Least-loaded live proxy with room (IMVU cap = PROXY_PER_IP)."""
+        best = None
+        best_n = None
+        for spec in self.live:
+            if spec.key() in self.bad:
+                continue
+            n = len(self.users.get(spec.key(), set()))
+            if n >= self.per_ip:
+                continue
+            if best is None or n < best_n:
+                best = spec
+                best_n = n
+                if n == 0:
+                    break
+        return best
+
+    def claim(self, session):
+        with self.lock:
+            name = session.username
+            cur = self.assigned.get(name)
+            if cur and cur.key() not in self.bad:
+                used = self.users.get(cur.key(), set())
+                if name in used or len(used) < self.per_ip:
+                    if name not in used:
+                        used = self.users.setdefault(cur.key(), set())
+                        used.add(name)
+                    session.proxy = cur
+                    return cur
+            if cur:
+                self._unassign(name)
+            spec = self._pick()
+            if spec is None:
+                session.proxy = None
+                return None
+            self.assigned[name] = spec
+            self.users.setdefault(spec.key(), set()).add(name)
+            session.proxy = spec
+            return spec
+
+    def ensure(self, session):
+        return self.claim(session)
+
+    def _check(self, spec):
+        return probe_proxy_imvu(
+            spec, self.login_host, self.login_path,
+            imq_host=self.imq_host)
+
+    def _add_live(self, spec):
+        with self.lock:
+            if spec.key() in self.bad:
+                return False
+            keys = set(p.key() for p in self.live)
+            if spec.key() in keys:
+                return False
+            self.live.append(spec)
+            self.seen.add(spec.key())
+            return True
+
+    def promote(self, count=1):
+        added = 0
+        while added < count:
+            with self.lock:
+                spec = None
+                while self.reserve:
+                    cand = self.reserve.pop(0)
+                    if cand.key() not in self.bad:
+                        spec = cand
+                        break
+            if spec is None:
+                return added
+            if self._check(spec) and self._add_live(spec):
+                added += 1
+                _proxy_note('proxy + %s (%s)' % (spec.host, self.status_line()))
+        return added
+
+    def rotate(self, session):
+        with self.lock:
+            name = session.username
+            old = self._unassign(name)
+            if old:
+                self.bad.add(old.key())
+        nxt = self.claim(session)
+        if nxt is None or (old and nxt.key() == old.key()):
+            self.promote(2)
+            nxt = self.claim(session)
+            if old and nxt and nxt.key() == old.key():
+                nxt = None
+        return old, nxt
+
+    def release(self, session):
+        with self.lock:
+            self._unassign(session.username)
+        session.proxy = None
+
+    def set_imq_host(self, host):
+        host = (host or '').strip()
+        if not host:
+            return
+        self.imq_host = host
+
+    def start_hunter(self, opts):
+        self._opts = opts
+        self._stop = getattr(opts, 'stop_event', None)
+        if self._hunter and self._hunter.is_alive():
+            return
+        t = threading.Thread(target=self._hunt_loop, name='proxy-hunt')
+        t.daemon = True
+        t.start()
+        self._hunter = t
+
+    def _merge_new(self, specs):
+        added = 0
+        with self.lock:
+            live_keys = set(p.key() for p in self.live)
+            res_keys = set(p.key() for p in self.reserve)
+            for spec in specs:
+                key = spec.key()
+                if key in self.bad or key in live_keys or key in res_keys:
+                    continue
+                if key in self.seen and key not in live_keys:
+                    continue
+                self.reserve.append(spec)
+                self.seen.add(key)
+                res_keys.add(key)
+                added += 1
+        return added
+
+    def _fetch_more(self, opts):
+        try:
+            fresh = collect_proxies_from_apis(opts, quiet=True)
+        except Exception:
+            return 0
+        n = self._merge_new(fresh)
+        if n:
+            _proxy_note('api +%d reserve' % n)
+        return n
+
+    def _hunt_loop(self):
+        last_fetch = 0
+        while True:
+            stop = self._stop
+            if stop is not None and stop.is_set():
+                return
+            live = self.live_count()
+            slots = live * self.per_ip
+            short = live < self.want or slots < self.n_accounts
+            if short:
+                if time.time() - last_fetch > 40:
+                    if self._opts is not None:
+                        self._fetch_more(self._opts)
+                    last_fetch = time.time()
+                self.promote(3)
+            if stop is not None:
+                if stop.wait(8.0):
+                    return
+            else:
+                time.sleep(8.0)
+
+    def claim_wait(self, session, stop_event=None, timeout=None):
+        stop = stop_event or getattr(session, 'stop_event', None)
+        deadline = (time.time() + timeout) if timeout else None
+        last_log = 0
+        while True:
+            spec = self.claim(session)
+            if spec:
+                return spec
+            if self.promote(1):
+                continue
+            spec = self.claim(session)
+            if spec:
+                return spec
+            if session.halt is not None and session.halt.is_set():
+                return None
+            if stop is not None and stop.is_set():
+                return None
+            if deadline is not None and time.time() >= deadline:
+                return None
+            now = time.time()
+            if now - last_log >= 15:
+                log(session, 'waiting for ip slot (%d/ip)' % self.per_ip)
+                last_log = now
+            if stop is not None:
+                if stop.wait(3.0):
+                    return None
+            else:
+                time.sleep(3.0)
+
+
+def _proxy_note(text):
+    class _P(object):
+        username = 'proxy'
+    log(_P(), text)
+
+
+def prepare_proxies(opts):
+    opts.proxy_pool = None
+    if not getattr(opts, 'use_proxy', False):
+        return 0
+    here = os.path.dirname(os.path.abspath(__file__))
+    path = getattr(opts, 'proxies_file', None) or os.path.join(here, 'proxies.txt')
+    found = load_proxies_file(path)
+    found.extend(collect_proxies_from_apis(opts))
+    seen = set()
+    unique = []
+    for spec in found:
+        if spec.key() in seen:
+            continue
+        seen.add(spec.key())
+        unique.append(spec)
+    file_keys = set(p.key() for p in load_proxies_file(path))
+    keep = [p for p in unique if p.key() in file_keys]
+    rest = [p for p in unique if p.key() not in file_keys]
+    random.shuffle(rest)
+    unique = keep + rest
+    n_accounts = int(getattr(opts, 'total_accounts', 0)
+                     or getattr(opts, 'count', 0) or 8)
+    need = proxies_needed(n_accounts)
+    want = min(16, max(need + 3, need * 2, 3))
+    login_host = getattr(opts, 'secure_host', None) or 'secure.imvu.com'
+    login_path = getattr(opts, 'client_endpoint', None) or '/api/xmlrpc/client.php'
+    imq_host = getattr(opts, 'imq_host', None) or None
+    _proxy_note('need %d ips (%d agents · %d/ip) · hunting %d'
+                % (need, n_accounts, PROXY_PER_IP, len(unique)))
+
+    def check(spec):
+        return probe_proxy_imvu(spec, login_host, login_path, imq_host=imq_host)
+
+    live = []
+    leftover = unique[:]
+    checked = 0
+    max_check = 280
+    while leftover and len(live) < want and checked < max_check:
+        batch = leftover[:32]
+        leftover = leftover[32:]
+        checked += len(batch)
+        live.extend(probe_proxies(batch, want - len(live), check))
+        if len(live) >= need and checked >= 96 and len(live) >= want:
+            break
+        if len(live) >= need and checked >= 160:
+            break
+    if not live:
+        raise BackendError('no working proxies from api')
+    pool = ProxyPool()
+    pool.live = live
+    pool.reserve = leftover
+    pool.seen = set(p.key() for p in unique)
+    pool.login_host = login_host
+    pool.login_path = login_path
+    pool.imq_host = imq_host
+    pool.probe_host = login_host
+    pool.probe_port = 443
+    pool.need = need
+    pool.want = want
+    pool.n_accounts = n_accounts
+    opts.proxy_pool = pool
+    pool.start_hunter(opts)
+    _proxy_note('proxies %s · %d reserve · hunting'
+                % (pool.status_line(), len(leftover)))
+    return len(live)
+
+
+def run_via_proxy(session, opts, fn):
+    pool = getattr(opts, 'proxy_pool', None)
+    stop = getattr(opts, 'stop_event', None)
+    if pool:
+        if not pool.claim_wait(session, stop_event=stop):
+            raise BackendError('no working proxies')
+    tries = PROXY_RETRY if pool else 1
+    last = None
+    for _ in range(tries):
+        try:
+            return fn()
+        except Exception as e:
+            last = e
+            if not pool or not proxy_transport_error(e):
+                raise
+            old, nxt = pool.rotate(session)
+            old_ip = old.host if old else '?'
+            if nxt is None:
+                if pool.claim_wait(session, stop_event=stop):
+                    continue
+                raise BackendError('proxy dead %s — none left' % old_ip)
+            log(session, 'proxy dead %s — retry %s' % (old_ip, nxt.host))
+    raise last
+
+
+def bump_proxy(session, opts, err=None):
+    pool = getattr(opts, 'proxy_pool', None)
+    if not pool:
+        return
+    if err is not None and not proxy_transport_error(err):
+        pool.ensure(session)
+        return
+    old, nxt = pool.rotate(session)
+    if old and nxt:
+        log(session, 'proxy dead %s — retry %s' % (old.host, nxt.host))
+    elif old and nxt is None:
+        log(session, 'proxy dead %s — none left' % old.host)
+
+
+def http_exchange(sock, method, path, headers, body, timeout):
+    sock.settimeout(timeout)
+    lines = ['%s %s HTTP/1.1' % (method, path)]
+    for key, value in headers:
+        lines.append('%s: %s' % (key, value))
+    if body:
+        lines.append('Content-Length: %d' % len(body))
+    lines.append('Connection: close')
+    lines.append('')
+    raw = '\r\n'.join(lines).encode('utf-8') + b'\r\n'
+    if body:
+        raw += body
+    sock.sendall(raw)
+    resp = http.client.HTTPResponse(sock)
+    resp.begin()
+    data = resp.read()
+    status = resp.status
+    try:
+        resp.close()
+    except Exception:
+        pass
+    return status, data
+
+
+def urlopen_bytes(req, timeout=30, context=None, proxy=None):
+    if proxy is None:
+        with urllib.request.urlopen(req, timeout=timeout, context=context) as resp:
+            return resp.getcode(), resp.read()
+    parsed = urllib.parse.urlparse(req.full_url)
+    host = parsed.hostname
+    port = parsed.port or (443 if parsed.scheme == 'https' else 80)
+    path = parsed.path or '/'
+    if parsed.query:
+        path += '?' + parsed.query
+    raw = open_via_proxy(host, port, proxy, timeout)
+    try:
+        if parsed.scheme == 'https':
+            if context is None:
+                context = ssl.create_default_context()
+            sock = context.wrap_socket(raw, server_hostname=host)
+        else:
+            sock = raw
+        hdrs = [('Host', parsed.netloc)]
+        for key, value in req.header_items():
+            if key.lower() != 'host':
+                hdrs.append((key, value))
+        return http_exchange(sock, req.get_method(), path, hdrs, req.data, timeout)
+    finally:
+        try:
+            raw.close()
+        except Exception:
+            pass
+
+
+def xmlrpc_call(url, method, params, auth=None, insecure=False, timeout=30,
+                proxy=None, session=None):
+    if proxy is None and session is not None:
+        proxy = getattr(session, 'proxy', None)
     body = xmlrpc.client.dumps(params, methodname=method).encode('utf-8')
     headers = {
         'Content-Type': 'text/xml',
@@ -175,12 +979,18 @@ def xmlrpc_call(url, method, params, auth=None, insecure=False, timeout=30):
         context.check_hostname = False
         context.verify_mode = ssl.CERT_NONE
     try:
-        with urllib.request.urlopen(req, timeout=timeout, context=context) as resp:
-            data = resp.read()
+        status, data = urlopen_bytes(req, timeout=timeout, context=context,
+                                     proxy=proxy)
+        if status >= 400:
+            raise BackendError('HTTP %s from %s: %s' % (status, url, data[:200]))
+    except BackendError:
+        raise
     except urllib.error.HTTPError as e:
         raise BackendError('HTTP %s from %s: %s' % (e.code, url, e.read()[:200]))
     except urllib.error.URLError as e:
         raise BackendError('cannot reach %s: %s' % (url, e.reason))
+    except (socket.error, ssl.SSLError, OSError) as e:
+        raise BackendError('cannot reach %s: %s' % (url, e))
     try:
         out, _ = xmlrpc.client.loads(data)
     except xmlrpc.client.Fault as fault:
@@ -204,12 +1014,13 @@ def detect_key(info, candidates, override, what):
 # --- IMQ socket client -------------------------------------------------------
 
 class ImqClient(object):
-    def __init__(self, host, port, use_tls, insecure, timeout=15.0):
+    def __init__(self, host, port, use_tls, insecure, timeout=15.0, proxy=None):
         self.host = host
         self.port = port
         self.use_tls = use_tls
         self.insecure = insecure
         self.timeout = timeout
+        self.proxy = proxy
         self.sock = None
         self.buf = bytearray()
         self.op_id = 0
@@ -227,7 +1038,11 @@ class ImqClient(object):
         return self.op_id
 
     def open(self):
-        raw = socket.create_connection((self.host, self.port), timeout=self.timeout)
+        if self.proxy:
+            raw = open_via_proxy(self.host, self.port, self.proxy, self.timeout)
+        else:
+            raw = socket.create_connection((self.host, self.port),
+                                           timeout=self.timeout)
         if self.use_tls:
             if self.insecure:
                 context = ssl.create_default_context()
@@ -450,6 +1265,7 @@ class AccountSession(object):
         self.spam_thread = None
         self.joined_at = 0
         self._left_noted = False
+        self.proxy = None
 
 
 def probe_chat(session, info, opts, chat_id, timeout=30):
@@ -460,7 +1276,7 @@ def probe_chat(session, info, opts, chat_id, timeout=30):
     auth = (cid, info.get('clientSessionId', ''), info.get('securityKey', ''))
     args = {'userId': cid, 'chatId': int(chat_id)}
     return xmlrpc_call(url, 'chat.getParticipants', (args,), auth=auth,
-                       insecure=opts.insecure, timeout=timeout)
+                       insecure=opts.insecure, timeout=timeout, session=session)
 
 
 def find_rooms(session, info, opts, keywords):
@@ -486,8 +1302,9 @@ def find_rooms(session, info, opts, keywords):
     req = urllib.request.Request(url, headers=headers)
     context = insecure_context(opts)
     try:
-        with urllib.request.urlopen(req, timeout=30, context=context) as resp:
-            raw = resp.read().decode('utf-8', 'replace')
+        _status, raw_b = urlopen_bytes(req, timeout=30, context=context,
+                                       proxy=getattr(session, 'proxy', None))
+        raw = raw_b.decode('utf-8', 'replace')
     except urllib.error.HTTPError as e:
         raise BackendError('HTTP %s from room search: %s'
                            % (e.code, e.read()[:200]))
@@ -547,12 +1364,18 @@ def login(session, opts):
         'client_experiments': [],
         'password': session.password,
     }
-    info = xmlrpc_call(url, 'test.avatarInfoForLogin2', (params,),
-                       insecure=opts.insecure)
-    if not isinstance(info, dict):
-        raise BackendError('unexpected login response: %r' % (info,))
-    if opts.print_userinfo:
-        log(session, 'userInfo keys: %s' % sorted(info))
+    def once():
+        info = xmlrpc_call(url, 'test.avatarInfoForLogin2', (params,),
+                           insecure=opts.insecure, session=session)
+        if not isinstance(info, dict):
+            raise BackendError('unexpected login response: %r' % (info,))
+        if opts.print_userinfo:
+            log(session, 'userInfo keys: %s' % sorted(info))
+        return info
+    info = run_via_proxy(session, opts, once)
+    pool = getattr(opts, 'proxy_pool', None)
+    if pool is not None:
+        pool.set_imq_host((info or {}).get('imq_gateway_secure_host'))
     return info
 
 
@@ -573,17 +1396,31 @@ def connect_user_imq(session, opts, info=None):
     """Open IMQ with current login bits and subscribe /user/<cid>."""
     info = info if info is not None else session.info
     host, cookie, token = imq_connect_args(opts, info)
-    session.imq = ImqClient(host, opts.imq_port, not opts.imq_plain,
-                            opts.insecure)
-    session.imq.debug_frames = opts.debug_frames
-    t0 = time.time()
-    session.imq.connect(str(session.cid), cookie, token)
-    session.imq_ms = (time.time() - t0) * 1000
-    user_queue = '/user/%s' % session.cid
-    session.imq.subscribe(user_queue)
-    log(session, 'IMQ ok (%d ms)  sub %s' % (session.imq_ms, user_queue),
-        verbose=True)
-    return session.imq
+
+    def once():
+        if session.imq:
+            try:
+                session.imq.close()
+            except Exception:
+                pass
+            session.imq = None
+        session.imq = ImqClient(host, opts.imq_port, not opts.imq_plain,
+                                opts.insecure, proxy=session.proxy)
+        session.imq.debug_frames = opts.debug_frames
+        t0 = time.time()
+        session.imq.connect(str(session.cid), cookie, token)
+        session.imq_ms = (time.time() - t0) * 1000
+        user_queue = '/user/%s' % session.cid
+        session.imq.subscribe(user_queue)
+        if session.proxy:
+            log(session, 'IMQ ok (%d ms) via %s' % (session.imq_ms,
+                                                    session.proxy.host))
+        else:
+            log(session, 'IMQ ok (%d ms)  sub %s' % (session.imq_ms, user_queue),
+                verbose=True)
+        return session.imq
+
+    return run_via_proxy(session, opts, once)
 
 
 def chat_url(opts):
@@ -591,11 +1428,12 @@ def chat_url(opts):
 
 
 def session_ping(session, opts):
-    """XML-RPC session keepalive; the real client calls this every 110s."""
-    url = '%s://%s/api/xmlrpc/client.php' % (opts.service_scheme, opts.service_host)
+    """XML-RPC session keepalive on the same host as login (not the room-list host)."""
+    url = '%s://%s%s' % (opts.secure_scheme, opts.secure_host, opts.client_endpoint)
     auth = chat_auth(session, session.info)
     args = {'userId': session.cid, 'error_logs': []}
-    return xmlrpc_call(url, 'ping', (args,), auth=auth, insecure=opts.insecure)
+    return xmlrpc_call(url, 'ping', (args,), auth=auth, insecure=opts.insecure,
+                       session=session)
 
 
 def session_ping_loop(session, opts, stop_event):
@@ -604,8 +1442,13 @@ def session_ping_loop(session, opts, stop_event):
             return
         try:
             session_ping(session, opts)
-        except Exception:
-            pass
+            if opts.debug_frames:
+                log(session, 'session ping ok')
+        except Exception as e:
+            text = str(e)
+            if '-32601' in text or 'not specified' in text.lower():
+                continue
+            log(session, 'session ping failed: %s' % text.split('\n')[0][:80])
 
 
 def start_session_ping(session, opts, stop_event):
@@ -649,7 +1492,7 @@ def get_or_make_chat(session, info, opts, invite=None):
     else:
         args['chatId'] = 0
     result = xmlrpc_call(url, 'chat.getOrMakeChat', (args,), auth=auth,
-                         insecure=opts.insecure)
+                         insecure=opts.insecure, session=session)
     if not isinstance(result, dict):
         raise BackendError('unexpected getOrMakeChat response: %r' % (result,))
     if result.get('response') == 'declined':
@@ -1115,14 +1958,6 @@ def accept_invite_or_relogin(session, opts, chat_id, invite_id, location):
         return True
     except Exception as e:
         log(session, 'accept failed: %s' % e)
-        if room_full_error(e):
-            if imq_alive(session):
-                session.phase = 'idle'
-                bind_imq_session(session, opts, None)
-                log(session, 'room full  —  waiting')
-            else:
-                wait_for_invite(session, opts, 'room full')
-            return False
     if not relogin_session(session, opts):
         wait_for_invite(session, opts)
         return False
@@ -1171,20 +2006,18 @@ def try_handle_invite(session, opts, queue, message_bytes):
         session.chat_id = chat_id
         chat_queue = chat_queue_name(chat_id)
         try:
-            subscribe_after_accept(session, chat_queue, tries=4, gap=1.0)
+            subscribe_after_accept(session, chat_queue, tries=8, gap=1.0)
         except Exception as e:
-            missing = session_missing_from_chat(session, opts)
-            why = ('room full  —  not seated, waiting' if missing
-                   else 'subscribe after accept failed: %s' % e)
             if imq_alive(session):
-                log(session, why)
+                log(session, 'subscribe after accept failed: %s' % e)
                 session.chat_id = None
                 session.phase = 'idle'
                 bind_imq_session(session, opts, None)
-                if not missing:
-                    log(session, 'waiting for invite')
+                log(session, 'waiting for invite')
             else:
-                wait_for_invite(session, opts, why)
+                wait_for_invite(
+                    session, opts,
+                    'subscribe after accept failed: %s' % e)
             return True
         with opts.stats_lock:
             opts.stats['joined'] += 1
@@ -1308,8 +2141,9 @@ def fetch_avatar_name(session, opts, cid):
     req = urllib.request.Request(url, headers=headers)
     context = insecure_context(opts)
     try:
-        with urllib.request.urlopen(req, timeout=15, context=context) as resp:
-            raw = resp.read().decode('utf-8', 'replace')
+        _status, raw_b = urlopen_bytes(req, timeout=15, context=context,
+                                       proxy=getattr(session, 'proxy', None))
+        raw = raw_b.decode('utf-8', 'replace')
         data = json.loads(raw)
     except Exception:
         return None
@@ -2089,7 +2923,10 @@ def run_account(session, opts, stop_event, stats_lock):
         session.info = info
         session.login_ms = (time.time() - t0) * 1000
         session.cid = detect_key(info, CID_KEYS, opts.cid_key, 'customer id')
-        log(session, 'online')
+        if session.proxy:
+            log(session, 'online via %s' % session.proxy.host)
+        else:
+            log(session, 'online')
 
         if opts.churn:
             run_churn(session, info, opts, stop_event, stats_lock)
@@ -2118,6 +2955,7 @@ def run_account(session, opts, stop_event, stats_lock):
                 session.error = str(e)
                 session.phase = 'down'
                 log(session, 'ERROR: %s' % e)
+                bump_proxy(session, opts, e)
                 with stats_lock:
                     opts.stats['errors'] += 1
             if session_halted(session, stop_event) or opts.hold > 0:
@@ -2128,6 +2966,13 @@ def run_account(session, opts, stop_event, stats_lock):
                 break
             log(session, 'rejoining')
             drop_imq(session, opts)
+            err = session.error or ''
+            if 'no working prox' in err.lower() or 'none left' in err.lower():
+                if stop_event.wait(3.0):
+                    break
+                continue
+            if session.error:
+                bump_proxy(session, opts, session.error)
             if not relogin_session(session, opts):
                 if stop_event.wait(2.0):
                     break
@@ -2137,9 +2982,9 @@ def run_account(session, opts, stop_event, stats_lock):
                 break
     finally:
         drop_imq(session, opts, count_leave=False)
-
-
-_log_hook = None
+        px = getattr(opts, 'proxy_pool', None)
+        if px:
+            px.release(session)
 _log_verbose = False
 
 
@@ -2257,6 +3102,10 @@ def main(argv=None):
                         help='IMQ over plain TCP instead of TLS')
     parser.add_argument('--insecure', action='store_true',
                         help='do not verify TLS certificates')
+    parser.add_argument('--proxy', action='store_true',
+                        help='send each account through a proxy (spread load)')
+    parser.add_argument('--proxy-api', default=DEFAULT_PROXY_API,
+                        help='URL that returns ip:port lines (SOCKS5 preferred)')
 
     parser.add_argument('--client-version', default='554.0')
     parser.add_argument('--cid-key', help='customer id key in login response')
@@ -2267,6 +3116,7 @@ def main(argv=None):
                         help='log every IMQ frame received while subscribing')
 
     opts = parser.parse_args(argv)
+    opts.use_proxy = bool(getattr(opts, 'proxy', False))
     if opts.host:
         opts.secure_host = opts.chat_host = opts.service_host = opts.host
     global _log_verbose
@@ -2319,6 +3169,15 @@ def run_load(opts):
     opts.sessions = accounts
     if not accounts:
         print('no accounts in %s' % opts.accounts)
+        return 1
+
+    try:
+        prepare_proxies(opts)
+    except BackendError as e:
+        if not getattr(opts, 'tui', False):
+            print(e)
+        else:
+            _proxy_note(str(e))
         return 1
 
     if opts.probe_chat:
@@ -2393,12 +3252,6 @@ def run_load(opts):
                 worker = workers.get(session.username)
                 if worker is not None and worker.is_alive():
                     any_alive = True
-                    continue
-                if not getattr(opts, 'tui', False):
-                    continue
-                log(session, 'restart')
-                spawn_account(session)
-                any_alive = True
             if not any_alive:
                 break
         if stop_event.is_set():
@@ -2585,20 +3438,19 @@ def accept_invite(session, opts, chat_id, invite_id, location):
     args = {'userId': session.cid, 'inviteId': invite_id, 'chatId': chat_id}
     try:
         result = xmlrpc_call(url, 'chat.acceptInvite', (args,), auth=auth,
-                             insecure=opts.insecure)
+                             insecure=opts.insecure, session=session)
     except BackendError as e:
-        if room_full_error(e):
-            raise BackendError('room full: %s' % e)
         if not accept_method_missing(e):
             log(session, 'acceptInvite failed: %s' % e, verbose=True)
         result = None
     else:
         if isinstance(result, dict) and result.get('response') == 'declined':
             reason = '%s %s' % (result.get('reason'), result.get('explanation'))
-            if room_full_error(reason):
-                raise BackendError('room full: %s' % reason.strip())
-            raise BackendError('accept declined: %s' % reason.strip())
-        return result
+            log(session, 'accept declined: %s — trying getOrMakeChat' % reason.strip(),
+                verbose=True)
+            result = None
+        else:
+            return result
     args2 = {'userId': session.cid, 'version': opts.client_version,
              'publicroom': True, 'private': True}
     if chat_id:
@@ -2608,10 +3460,12 @@ def accept_invite(session, opts, chat_id, invite_id, location):
         args2['activity'] = 'publicroom-%s' % room
         args2['private'] = False
     result = xmlrpc_call(url, 'chat.getOrMakeChat', (args2,), auth=auth,
-                         insecure=opts.insecure)
+                         insecure=opts.insecure, session=session)
     if isinstance(result, dict) and result.get('response') == 'declined':
         reason = '%s %s' % (result.get('reason'), result.get('explanation'))
-        raise BackendError('join declined: %s' % reason.strip())
+        log(session, 'getOrMakeChat declined: %s — joining via invite anyway'
+            % reason.strip())
+        return {'chatId': chat_id}
     return result
 
 
@@ -2670,7 +3524,10 @@ def run_listen_invite(session, opts, stop_event, stats_lock):
         session.info = info
         session.login_ms = (time.time() - t0) * 1000
         session.cid = detect_key(info, CID_KEYS, opts.cid_key, 'customer id')
-        log(session, 'waiting for invite')
+        if session.proxy:
+            log(session, 'waiting for invite via %s' % session.proxy.host)
+        else:
+            log(session, 'waiting for invite')
         with stats_lock:
             opts.stats['ready'] = opts.stats.get('ready', 0) + 1
             opts.ready_cids.append(str(session.cid))
@@ -2696,6 +3553,7 @@ def run_listen_invite(session, opts, stop_event, stats_lock):
                 session.error = str(e)
                 session.phase = 'down'
                 log(session, 'ERROR: %s' % e)
+                bump_proxy(session, opts, e)
                 with stats_lock:
                     opts.stats['errors'] += 1
             if session_halted(session, stop_event) or opts.hold > 0:
@@ -2706,6 +3564,12 @@ def run_listen_invite(session, opts, stop_event, stats_lock):
                 break
             log(session, 'reconnecting')
             drop_imq(session, opts)
+            err = session.error or ''
+            if 'no working prox' in err.lower() or 'none left' in err.lower():
+                if stop_event.wait(3.0):
+                    break
+                continue
+            bump_proxy(session, opts, session.error or 'closed')
             if not relogin_session(session, opts):
                 if stop_event.wait(2.0):
                     break
@@ -2714,6 +3578,9 @@ def run_listen_invite(session, opts, stop_event, stats_lock):
                 break
     finally:
         drop_imq(session, opts, count_leave=False)
+        px = getattr(opts, 'proxy_pool', None)
+        if px:
+            px.release(session)
 
 
 if __name__ == '__main__':

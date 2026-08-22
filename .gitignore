@@ -1,4 +1,5 @@
 accounts.txt
+proxies.txt
 __pycache__/
 .roomload.json
 .venv/

@@ -83,6 +83,8 @@ def load_config():
         'spam_delay_max': 0.4,
         'spam_auto': False,
         'spam_style': 'phrase',
+        'proxy': False,
+        'proxy_api': r.DEFAULT_PROXY_API,
     }
     path = _config_path()
     if not os.path.isfile(path):
@@ -139,11 +141,20 @@ def account_total(opts):
         return 0
 
 
+def _proxy_api_shown(cfg):
+    val = (cfg.get('proxy_api') or '').strip()
+    if not val or val == r.DEFAULT_PROXY_API:
+        return ''
+    return val
+
+
 def apply_cfg(opts, cfg):
     opts.room = (cfg.get('room') or '').strip() or None
     opts.chat_id = None
     opts.count = int(cfg.get('count') or 0)
     opts.insecure = bool(cfg.get('insecure', True))
+    opts.use_proxy = bool(cfg.get('proxy'))
+    opts.proxy_api = (cfg.get('proxy_api') or r.DEFAULT_PROXY_API).strip()
     opts.message = cfg.get('message') or 'hola'
     opts.trigger = (cfg.get('trigger') or '').strip() or None
     opts.stop_trigger = (cfg.get('stop_trigger') or '').strip() or None
@@ -244,8 +255,16 @@ def _agent_label(session):
         if err and err.lower() not in ('disconnected', 'down', 'offline'):
             extra = 'offline  %s' % err[:16]
     tone = 'red' if phase == 'down' else 'dim'
+    pip = proxy_ip(session)
+    if pip:
+        extra = '%s  %s' % (extra, pip)
     return _phase_mark(phase).format(
         '%s  [%s]%s[/]' % (session.username, tone, extra))
+
+
+def proxy_ip(session):
+    px = getattr(session, 'proxy', None)
+    return px.host if px else ''
 
 
 def _wordlist_line_count(opts):
@@ -770,9 +789,10 @@ def run_tui(opts):
             background: #1a2740;
             color: #2de2e6;
             min-width: 10;
+            margin-right: 1;
         }
         #wordlist:hover { background: #243656; }
-        #wl-count { width: auto; color: #6b7a94; content-align: left middle; }
+        #wl-count { width: 1fr; color: #6b7a94; content-align: left middle; }
         #agents-label { height: 1; color: #5c6b84; margin-top: 1; }
         #agents {
             height: 1fr;
@@ -819,7 +839,8 @@ def run_tui(opts):
         #actions {
             height: 1;
             align: left middle;
-            margin-top: 1;
+            margin-top: 0;
+            margin-bottom: 1;
         }
         Button {
             height: 1;
@@ -841,7 +862,18 @@ def run_tui(opts):
         }
         #stop:hover { background: #ff5a8c; }
         #flash { color: #ff2a6d; width: 1fr; content-align: left middle; }
-        #insecure { width: auto; color: #6b7a94; }
+        #insecure, #use-proxy {
+            width: auto;
+            color: #8b97ad;
+            margin-right: 2;
+        }
+        #proxy-api { width: 1fr; }
+        #proxy-stat {
+            width: auto;
+            color: #5c6b84;
+            content-align: left middle;
+            margin-left: 1;
+        }
         #stats { height: 1; color: #5c6b84; margin-top: 2; }
         #bots { height: auto; color: #8b97ad; }
         #log {
@@ -947,15 +979,29 @@ def run_tui(opts):
                         yield Button('  edit  ', id='wordlist', compact=True,
                                      flat=True)
                         yield Static('', id='wl-count')
-                    with Horizontal(id='actions'):
+                    with Horizontal(id='actions', classes='field-row'):
+                        yield Label('run', classes='lbl')
                         yield Button('  start  ', id='start', compact=True,
                                      flat=True)
                         yield Button('  stop  ', id='stop', compact=True,
                                      flat=True, disabled=True)
+                    with Horizontal(classes='field-row'):
+                        yield Label('net', classes='lbl')
                         yield Checkbox(
                             'skip TLS',
                             value=bool(self.cfg.get('insecure', True)),
                             id='insecure', compact=True)
+                        yield Checkbox(
+                            'proxies',
+                            value=bool(self.cfg.get('proxy')),
+                            id='use-proxy', compact=True)
+                    with Horizontal(classes='field-row'):
+                        yield Label('list', classes='lbl')
+                        yield Input(
+                            _proxy_api_shown(self.cfg),
+                            placeholder='empty = hunt socks5 via api',
+                            id='proxy-api', compact=True)
+                        yield Static('', id='proxy-stat')
                     yield Label('', id='flash')
                     yield Static('', id='stats')
                     yield Static('agents', id='agents-label')
@@ -1014,6 +1060,10 @@ def run_tui(opts):
             self.cfg['trigger_from'] = (
                 self.query_one('#trigger_from', Input).value.strip())
             self.cfg['insecure'] = self.query_one('#insecure', Checkbox).value
+            self.cfg['proxy'] = self.query_one('#use-proxy', Checkbox).value
+            self.cfg['proxy_api'] = (
+                self.query_one('#proxy-api', Input).value.strip()
+                or r.DEFAULT_PROXY_API)
             self.cfg['spam_auto'] = self.query_one('#auto', Checkbox).value
             self.cfg['spam_style'] = norm_spam_style(
                 self.query_one('#spam_style', Select).value)
@@ -1068,7 +1118,10 @@ def run_tui(opts):
             if account_total(self.opts) == 0:
                 self._flash('no accounts in accounts.txt')
                 return
-            self._flash('')
+            if self.opts.use_proxy:
+                self._flash('hunting proxies via api…')
+            else:
+                self._flash('')
             with self._lock:
                 self._pending = []
             self.query_one('#log', Log).clear()
@@ -1197,7 +1250,7 @@ def run_tui(opts):
                 self._read_form()
 
         def on_checkbox_changed(self, event):
-            if (event.checkbox.id in ('auto', 'insecure')
+            if (event.checkbox.id in ('auto', 'insecure', 'use-proxy')
                     and self._thread and self._thread.is_alive()):
                 self._read_form()
 
@@ -1270,6 +1323,16 @@ def run_tui(opts):
                 return
             if not thread.is_alive():
                 self._set_live(False)
+            pool = getattr(self.opts, 'proxy_pool', None)
+            if getattr(self.opts, 'use_proxy', False) and pool:
+                pstat = pool.status_line()
+            elif getattr(self.opts, 'use_proxy', False):
+                pstat = '…'
+            else:
+                pstat = ''
+            if pstat != getattr(self, '_proxy_stat_sig', None):
+                self._proxy_stat_sig = pstat
+                self.query_one('#proxy-stat', Static).update(pstat)
             stats = getattr(self.opts, 'stats', None) or {}
             sessions = getattr(self.opts, 'sessions', None) or []
             for session in sessions:
@@ -1311,7 +1374,7 @@ def run_tui(opts):
                 (s.username, _session_phase(s), bool(s.chat_id),
                  r.imq_alive(s), r.spam_loop_alive(s),
                  bool(getattr(s, '_left_noted', False)),
-                 (s.error or '')[:24])
+                 (s.error or '')[:24], proxy_ip(s))
                 for s in live
             )
             if sig == self._agent_sig:
