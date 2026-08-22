@@ -85,6 +85,8 @@ def load_config():
         'spam_style': 'phrase',
         'proxy': False,
         'proxy_api': r.DEFAULT_PROXY_API,
+        'split_pc': 0,
+        'split_hot': 0,
     }
     path = _config_path()
     if not os.path.isfile(path):
@@ -143,7 +145,7 @@ def account_total(opts):
 
 def _proxy_api_shown(cfg):
     val = (cfg.get('proxy_api') or '').strip()
-    if not val or val == r.DEFAULT_PROXY_API:
+    if r.is_builtin_proxy_api(val):
         return ''
     return val
 
@@ -155,6 +157,19 @@ def apply_cfg(opts, cfg):
     opts.insecure = bool(cfg.get('insecure', True))
     opts.use_proxy = bool(cfg.get('proxy'))
     opts.proxy_api = (cfg.get('proxy_api') or r.DEFAULT_PROXY_API).strip()
+    try:
+        opts.split_pc = max(0, int(cfg.get('split_pc') or 0))
+    except (TypeError, ValueError):
+        opts.split_pc = 0
+    try:
+        opts.split_hot = max(0, int(cfg.get('split_hot') or 0))
+    except (TypeError, ValueError):
+        opts.split_hot = 0
+    opts.bind_pc = (cfg.get('bind_pc') or '').strip()
+    opts.bind_hot = (cfg.get('bind_hot') or '').strip()
+    need = opts.split_pc + opts.split_hot
+    if need and not opts.use_proxy and (not opts.count or opts.count < need):
+        opts.count = need
     opts.message = cfg.get('message') or 'hola'
     opts.trigger = (cfg.get('trigger') or '').strip() or None
     opts.stop_trigger = (cfg.get('stop_trigger') or '').strip() or None
@@ -180,7 +195,7 @@ def apply_cfg(opts, cfg):
     opts.hold = 0
     opts.tui = True
     if not opts.ramp:
-        opts.ramp = 0.35
+        opts.ramp = 1.2 if not opts.use_proxy else 0.35
 
 
 def delay_range(cfg):
@@ -232,9 +247,11 @@ def _phase_mark(phase):
         return '[bold green]●[/] {0}'
     if phase == 'login':
         return '[bold yellow]●[/] {0}'
+    if phase == 'imq':
+        return '[bold yellow]◐[/] {0}'
     if phase == 'down':
         return '[bold red]●[/] {0}'
-    return '[dim]○[/] {0}'
+    return '[bold cyan]○[/] {0}'
 
 
 def _session_phase(session):
@@ -247,6 +264,7 @@ def _agent_label(session):
         'spam': 'spam',
         'in-room': 'in room',
         'login': 'login',
+        'imq': 'imq',
         'down': 'offline',
         'idle': 'waiting',
     }.get(phase, phase)
@@ -264,7 +282,10 @@ def _agent_label(session):
 
 def proxy_ip(session):
     px = getattr(session, 'proxy', None)
-    return px.host if px else ''
+    if px:
+        return px.host
+    via = getattr(session, 'bind_via', None) or ''
+    return via
 
 
 def _wordlist_line_count(opts):
@@ -777,7 +798,12 @@ def run_tui(opts):
         Input:focus, Select:focus, TextArea:focus {
             background: #172033;
         }
-        #count, #delay, #delay-max { width: 7; }
+        #count, #delay, #delay-max, #split-pc, #split-hot { width: 7; }
+        .via-tag {
+            width: 4;
+            color: #6b7a94;
+            content-align: left middle;
+        }
         .delay-sep {
             width: 2;
             color: #6b7a94;
@@ -917,6 +943,7 @@ def run_tui(opts):
             self._started = 0
             self._pending = []
             self._lock = threading.Lock()
+            self._via_auto = True
             self._agent_sig = None
             self._cid_sig = None
             self._idle_sig = None
@@ -996,10 +1023,20 @@ def run_tui(opts):
                             value=bool(self.cfg.get('proxy')),
                             id='use-proxy', compact=True)
                     with Horizontal(classes='field-row'):
+                        yield Label('via', classes='lbl')
+                        yield Static('pc', classes='via-tag')
+                        yield Input(str(self.cfg.get('split_pc') or 0),
+                                    placeholder='auto', id='split-pc',
+                                    compact=True)
+                        yield Static('hot', classes='via-tag')
+                        yield Input(str(self.cfg.get('split_hot') or 0),
+                                    placeholder='auto', id='split-hot',
+                                    compact=True)
+                    with Horizontal(classes='field-row'):
                         yield Label('list', classes='lbl')
                         yield Input(
                             _proxy_api_shown(self.cfg),
-                            placeholder='empty = hunt socks5 via api',
+                            placeholder='empty = hproxy + checked lists',
                             id='proxy-api', compact=True)
                         yield Static('', id='proxy-stat')
                     yield Label('', id='flash')
@@ -1038,7 +1075,31 @@ def run_tui(opts):
 
         def on_mount(self):
             self._refresh_wl_count()
+            self._fill_via_boxes()
             self.set_interval(0.1, self._tick)
+
+        def _fill_via_boxes(self):
+            if self.query_one('#use-proxy', Checkbox).value:
+                return
+            fid = getattr(self.focused, 'id', None) if self.focused else None
+            if fid in ('split-pc', 'split-hot'):
+                self._via_auto = False
+                return
+            if not getattr(self, '_via_auto', True):
+                return
+            lan, cell, _rows = r.pick_split_ifs()
+            n = account_total(self.opts)
+            pc_n, hot_n = r.auto_split_counts(n, lan, cell)
+            pc_box = self.query_one('#split-pc', Input)
+            hot_box = self.query_one('#split-hot', Input)
+            pc_s = str(pc_n)
+            hot_s = str(hot_n)
+            if pc_box.value != pc_s:
+                pc_box.value = pc_s
+            if hot_box.value != hot_s:
+                hot_box.value = hot_s
+            self.cfg['split_pc'] = pc_n
+            self.cfg['split_hot'] = hot_n
 
         def _refresh_wl_count(self):
             n = _wordlist_line_count(self.opts)
@@ -1064,6 +1125,16 @@ def run_tui(opts):
             self.cfg['proxy_api'] = (
                 self.query_one('#proxy-api', Input).value.strip()
                 or r.DEFAULT_PROXY_API)
+            try:
+                self.cfg['split_pc'] = max(
+                    0, int(self.query_one('#split-pc', Input).value.strip() or 0))
+            except ValueError:
+                return 'pc must be a number'
+            try:
+                self.cfg['split_hot'] = max(
+                    0, int(self.query_one('#split-hot', Input).value.strip() or 0))
+            except ValueError:
+                return 'hot must be a number'
             self.cfg['spam_auto'] = self.query_one('#auto', Checkbox).value
             self.cfg['spam_style'] = norm_spam_style(
                 self.query_one('#spam_style', Select).value)
@@ -1121,7 +1192,31 @@ def run_tui(opts):
             if self.opts.use_proxy:
                 self._flash('hunting proxies via api…')
             else:
-                self._flash('')
+                lan, cell, _rows = r.pick_split_ifs(
+                    getattr(self.opts, 'bind_pc', None),
+                    getattr(self.opts, 'bind_hot', None))
+                manual = self.opts.split_pc or self.opts.split_hot
+                if manual:
+                    if self.opts.split_pc and not lan:
+                        self._flash(
+                            'no pc nic — keep ethernet/home wifi, phone on usb/wifi')
+                        return
+                    if self.opts.split_hot and not cell:
+                        self._flash(
+                            'no hotspot — connect the phone (usb or wifi)')
+                        return
+                    if lan and cell and lan[1] == cell[1]:
+                        self._flash('pc and hotspot are the same nic')
+                        return
+                line = r.split_status_line(self.opts)
+                if not manual and lan and cell and lan[1] != cell[1]:
+                    have = self.opts.count or account_total(self.opts)
+                    pc_n, hot_n = r.auto_split_counts(have, lan, cell)
+                    self._flash('auto %d pc · %d hot · %s' % (pc_n, hot_n, line))
+                elif line:
+                    self._flash(line)
+                else:
+                    self._flash('')
             with self._lock:
                 self._pending = []
             self.query_one('#log', Log).clear()
@@ -1318,21 +1413,22 @@ def run_tui(opts):
             logw = self.query_one('#log', Log)
             for line in extra:
                 logw.write_line(line)
-            thread = self._thread
-            if not thread:
-                return
-            if not thread.is_alive():
-                self._set_live(False)
+            self._fill_via_boxes()
             pool = getattr(self.opts, 'proxy_pool', None)
             if getattr(self.opts, 'use_proxy', False) and pool:
                 pstat = pool.status_line()
             elif getattr(self.opts, 'use_proxy', False):
                 pstat = '…'
             else:
-                pstat = ''
+                pstat = r.split_status_line(self.opts)
             if pstat != getattr(self, '_proxy_stat_sig', None):
                 self._proxy_stat_sig = pstat
                 self.query_one('#proxy-stat', Static).update(pstat)
+            thread = self._thread
+            if not thread:
+                return
+            if not thread.is_alive():
+                self._set_live(False)
             stats = getattr(self.opts, 'stats', None) or {}
             sessions = getattr(self.opts, 'sessions', None) or []
             for session in sessions:
@@ -1340,13 +1436,14 @@ def run_tui(opts):
             joined = sum(1 for s in sessions
                          if _session_phase(s) in ('in-room', 'spam'))
             waiting = sum(1 for s in sessions if _session_phase(s) == 'idle')
+            imq_n = sum(1 for s in sessions if _session_phase(s) == 'imq')
             offline = sum(1 for s in sessions if _session_phase(s) == 'down')
             spam = sum(1 for s in sessions if _session_phase(s) == 'spam')
             elapsed = int(time.time() - self._started) if self._started else 0
             mps = r.spam_mps(self.opts)
             self.query_one('#stats', Static).update(
-                '[dim]%ds[/]  in %d  wait %d  off %d  spam %d  sent %d  [bold]%s/s[/]'
-                % (elapsed, joined, waiting, offline, spam,
+                '[dim]%ds[/]  in %d  wait %d  imq %d  off %d  spam %d  sent %d  [bold]%s/s[/]'
+                % (elapsed, joined, waiting, imq_n, offline, spam,
                    stats.get('sent', 0),
                    ('%.1f' % mps) if mps else '0.0')
             )
@@ -1374,6 +1471,7 @@ def run_tui(opts):
                 (s.username, _session_phase(s), bool(s.chat_id),
                  r.imq_alive(s), r.spam_loop_alive(s),
                  bool(getattr(s, '_left_noted', False)),
+                 bool(getattr(s, '_imq_pending', False)),
                  (s.error or '')[:24], proxy_ip(s))
                 for s in live
             )

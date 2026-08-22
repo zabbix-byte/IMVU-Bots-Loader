@@ -26,6 +26,7 @@ import random
 import socket
 import ssl
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -158,22 +159,26 @@ class BackendError(Exception):
 
 
 DEFAULT_PROXY_API = (
-    'https://api.proxyscrape.com/v2/?request=displayproxies'
-    '&protocol=socks5&timeout=15000&country=all'
+    'https://hproxy.com/api/proxy-list?format=txt&protocol=socks5'
+    '&sort=uptime&min_uptime_pct=30'
 )
 PROXY_EXTRA_APIS = (
-    'https://api.proxyscrape.com/v2/?request=displayproxies'
-    '&protocol=http&timeout=15000&country=all',
-    'https://proxylist.geonode.com/api/proxy-list?protocols=socks5'
-    '&limit=500&sort_by=lastChecked&sort_type=desc',
-    'https://www.proxy-list.download/api/v1/get?type=socks5',
-    'https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt',
-    'https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt',
-    'https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt',
+    'https://hproxy.com/api/proxy-list?format=txt&protocol=http'
+    '&sort=uptime&min_uptime_pct=30',
+    'https://fineproxy.org/wp-json/fineproxy/v1/free-proxies/txt',
+    'https://fineproxy.org/wp-json/fineproxy/v1/free-proxies/us/txt',
+    'https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main'
+    '/proxies/protocols/socks5/data.txt',
+    'https://api.proxyscrape.com/v4/free-proxy-list/get'
+    '?request=display_proxies&protocol=socks5'
+    '&proxy_format=ipport&format=text&timeout=20000',
 )
-# IMVU drops extra clients from the same public IP after this many.
+# IMVU allows this many clients per public IP. Free SOCKS lists usually
+# die at 1–2 tunnels, so API hunts use PROXY_PER_FREE instead.
 PROXY_PER_IP = 8
+PROXY_PER_FREE = 1
 PROXY_RETRY = 6
+PROXY_FAILS_BEFORE_BAD = 3
 PROBE_XML = (
     b'<?xml version="1.0"?>\n'
     b'<methodCall><methodName>system.listMethods</methodName>'
@@ -314,7 +319,14 @@ def load_proxies_file(path):
         return []
 
 
-def fetch_proxy_api(url, timeout=20):
+def _api_host(url):
+    try:
+        return urllib.parse.urlparse(url).hostname or url
+    except Exception:
+        return url
+
+
+def fetch_proxy_api(url, timeout=10):
     if not url:
         return []
     req = urllib.request.Request(
@@ -323,18 +335,28 @@ def fetch_proxy_api(url, timeout=20):
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return parse_proxy_payload(resp.read().decode('utf-8', 'replace'))
     except Exception as e:
-        raise BackendError('proxy api failed: %s' % e)
+        raise BackendError('%s %s' % (_api_host(url), e))
 
 
-def proxies_needed(n_accounts):
+def proxies_needed(n_accounts, per_ip=None):
+    cap = int(per_ip if per_ip is not None else PROXY_PER_IP)
+    if cap < 1:
+        cap = 1
     n = max(1, int(n_accounts or 1))
-    return (n + PROXY_PER_IP - 1) // PROXY_PER_IP
+    return (n + cap - 1) // cap
+
+
+def is_builtin_proxy_api(url):
+    text = (url or '').strip()
+    if not text or text == DEFAULT_PROXY_API:
+        return True
+    return text.startswith('https://api.proxyscrape.com/')
 
 
 def proxy_api_urls(opts):
     api = (getattr(opts, 'proxy_api', None) or '').strip()
     urls = []
-    if api and api != DEFAULT_PROXY_API:
+    if api and not is_builtin_proxy_api(api):
         urls.append(api)
     urls.append(DEFAULT_PROXY_API)
     for extra in PROXY_EXTRA_APIS:
@@ -344,13 +366,31 @@ def proxy_api_urls(opts):
 
 
 def collect_proxies_from_apis(opts, quiet=False):
+    urls = proxy_api_urls(opts)
     found = []
-    for url in proxy_api_urls(opts):
+    lock = threading.Lock()
+    misses = []
+
+    def one(url):
         try:
-            found.extend(fetch_proxy_api(url))
+            specs = fetch_proxy_api(url, timeout=10)
         except Exception as e:
-            if not quiet:
-                _proxy_note(str(e))
+            with lock:
+                misses.append(str(e))
+            return
+        with lock:
+            found.extend(specs)
+
+    threads = []
+    for url in urls:
+        t = threading.Thread(target=one, args=(url,))
+        t.daemon = True
+        t.start()
+        threads.append(t)
+    for t in threads:
+        t.join()
+    if not found and misses and not quiet:
+        _proxy_note('apis down: %s' % misses[0])
     return found
 
 
@@ -405,21 +445,187 @@ def http_connect(sock, dest_host, dest_port):
         raise BackendError('proxy CONNECT %s' % status)
 
 
-def open_via_proxy(dest_host, dest_port, proxy, timeout=8.0):
-    raw = socket.create_connection((proxy.host, proxy.port), timeout=timeout)
-    raw.settimeout(timeout)
+_IFACE_CACHE = [0.0, None]
+HOT_IP_PREFIX = (
+    '192.168.42.', '192.168.43.', '192.168.44.', '192.168.49.',
+    '192.168.137.', '172.20.10.',
+)
+HOT_IFACE_WORDS = (
+    'android', 'iphone', 'hotspot', 'tether', 'ndis', 'celular',
+    'cellular', 'remote ndis', 'bluetooth',
+)
+LAN_IFACE_WORDS = (
+    'ethernet', 'eth', 'realtek', 'gigabit', 'local area connection',
+)
+
+
+def list_local_ipv4():
+    """Active IPv4 nics, no loopback/APIPA. Cached a few seconds."""
+    now = time.time()
+    if _IFACE_CACHE[1] is not None and now - _IFACE_CACHE[0] < 3:
+        return list(_IFACE_CACHE[1])
+    rows = _ifaces_ipconfig() or _ifaces_getaddrinfo()
+    _IFACE_CACHE[0] = now
+    _IFACE_CACHE[1] = rows
+    return list(rows)
+
+
+def _ifaces_ipconfig():
+    if sys.platform != 'win32':
+        return []
     try:
-        if proxy.kind == 'http':
-            http_connect(raw, dest_host, dest_port)
-        else:
-            socks5_connect(raw, dest_host, dest_port)
+        raw = subprocess.check_output(['ipconfig'], timeout=6)
     except Exception:
+        return []
+    text = None
+    for enc in ('utf-8', 'cp850', 'cp1252', 'latin-1'):
         try:
-            raw.close()
+            text = raw.decode(enc)
+            break
         except Exception:
-            pass
-        raise
-    return raw
+            continue
+    if text is None:
+        text = raw.decode('latin-1', 'replace')
+    name = None
+    rows = []
+    for line in text.splitlines():
+        if line and not line[0].isspace() and line.rstrip().endswith(':'):
+            title = line.strip().rstrip(':').strip()
+            name = title
+            low = title.lower()
+            for sep in ('adapter ', 'adaptador de ', 'adaptador '):
+                idx = low.rfind(sep)
+                if idx >= 0:
+                    name = title[idx + len(sep):].strip()
+                    break
+            continue
+        if not name or 'ipv4' not in line.lower():
+            continue
+        found = re.search(r'(\d+\.\d+\.\d+\.\d+)', line)
+        if not found:
+            continue
+        ip = found.group(1)
+        if ip.startswith('127.') or ip.startswith('169.254.'):
+            continue
+        rows.append((name, ip))
+    return rows
+
+
+def _ifaces_getaddrinfo():
+    rows = []
+    seen = set()
+    try:
+        infos = socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET)
+    except Exception:
+        return rows
+    for info in infos:
+        ip = info[4][0]
+        if ip in seen or ip.startswith('127.') or ip.startswith('169.254.'):
+            continue
+        seen.add(ip)
+        rows.append((ip, ip))
+    return rows
+
+
+def _is_hot_iface(name, ip):
+    n = (name or '').lower()
+    if any((ip or '').startswith(p) for p in HOT_IP_PREFIX):
+        return True
+    return any(word in n for word in HOT_IFACE_WORDS)
+
+
+def _is_lan_iface(name):
+    n = (name or '').lower()
+    return any(word in n for word in LAN_IFACE_WORDS)
+
+
+def pick_split_ifs(pc_ip=None, hot_ip=None):
+    """Pick (lan_name, lan_ip), (hot_name, hot_ip) from live nics."""
+    rows = list_local_ipv4()
+    by_ip = {}
+    for name, ip in rows:
+        by_ip[ip] = (name, ip)
+    lan = by_ip.get((pc_ip or '').strip()) if pc_ip else None
+    cell = by_ip.get((hot_ip or '').strip()) if hot_ip else None
+    if cell is None:
+        for name, ip in rows:
+            if _is_hot_iface(name, ip):
+                cell = (name, ip)
+                break
+    if lan is None:
+        for name, ip in rows:
+            if cell and ip == cell[1]:
+                continue
+            if _is_lan_iface(name):
+                lan = (name, ip)
+                break
+        if lan is None:
+            for name, ip in rows:
+                if cell and ip == cell[1]:
+                    continue
+                lan = (name, ip)
+                break
+    return lan, cell, rows
+
+
+def session_bind_ip(session):
+    return getattr(session, 'bind_ip', None) or None
+
+
+def auto_split_counts(n_accounts, lan, cell, per_ip=None):
+    """Fill the PC nic first (more stable), then hotspot. IMVU cap per IP."""
+    cap = int(per_ip if per_ip is not None else PROXY_PER_IP)
+    if cap < 1:
+        cap = 8
+    n = max(0, int(n_accounts or 0))
+    if not lan or not cell or n < 1:
+        return 0, 0
+    if lan[1] == cell[1]:
+        return 0, 0
+    pc = min(cap, n)
+    hot = min(cap, n - pc)
+    return pc, hot
+
+
+def split_status_line(opts=None):
+    lan = getattr(opts, 'bind_lan', None) if opts else None
+    cell = getattr(opts, 'bind_hot', None) if opts else None
+    if lan is None and cell is None:
+        lan, cell, _rows = pick_split_ifs(
+            getattr(opts, 'bind_pc', None) if opts else None,
+            getattr(opts, 'bind_hot', None) if opts else None)
+    bits = []
+    if lan:
+        bits.append('pc %s' % lan[1])
+    if cell:
+        bits.append('hot %s' % cell[1])
+    return ' · '.join(bits)
+
+
+def open_tcp(dest_host, dest_port, timeout=8.0, proxy=None, bind_ip=None):
+    source = (bind_ip, 0) if bind_ip else None
+    if proxy is not None:
+        raw = socket.create_connection(
+            (proxy.host, proxy.port), timeout, source_address=source)
+        raw.settimeout(timeout)
+        try:
+            if proxy.kind == 'http':
+                http_connect(raw, dest_host, dest_port)
+            else:
+                socks5_connect(raw, dest_host, dest_port)
+        except Exception:
+            try:
+                raw.close()
+            except Exception:
+                pass
+            raise
+        return raw
+    return socket.create_connection(
+        (dest_host, dest_port), timeout, source_address=source)
+
+
+def open_via_proxy(dest_host, dest_port, proxy, timeout=8.0, bind_ip=None):
+    return open_tcp(dest_host, dest_port, timeout, proxy=proxy, bind_ip=bind_ip)
 
 
 def _http_status(chunk):
@@ -450,7 +656,7 @@ def probe_proxy_tls(proxy, dest_host, dest_port, timeout=5.0):
                 pass
 
 
-def probe_proxy(proxy, dest_host, dest_port, timeout=5.0,
+def probe_proxy(proxy, dest_host, dest_port, timeout=2.8,
                 path='/api/xmlrpc/client.php'):
     """SOCKS/CONNECT + TLS + real POST to IMVU. HEAD-only lets junk through."""
     sock = None
@@ -495,7 +701,7 @@ def probe_proxy(proxy, dest_host, dest_port, timeout=5.0,
 
 
 def probe_proxy_imvu(proxy, login_host, login_path, imq_host=None,
-                     timeout=5.0):
+                     timeout=2.8):
     if not probe_proxy(proxy, login_host, 443, timeout, path=login_path):
         return False
     if imq_host and imq_host != login_host:
@@ -513,6 +719,34 @@ def probe_proxies(proxies, want, check, workers=20):
         while True:
             with lock:
                 if idx[0] >= len(proxies) or len(live) >= want:
+                    return
+                spec = proxies[idx[0]]
+                idx[0] += 1
+            if check(spec):
+                with lock:
+                    live.append(spec)
+
+    threads = []
+    n = min(workers, max(1, len(proxies)))
+    for _ in range(n):
+        t = threading.Thread(target=worker)
+        t.daemon = True
+        t.start()
+        threads.append(t)
+    for t in threads:
+        t.join()
+    return live
+
+
+def probe_all(proxies, check, workers=16):
+    live = []
+    lock = threading.Lock()
+    idx = [0]
+
+    def worker():
+        while True:
+            with lock:
+                if idx[0] >= len(proxies):
                     return
                 spec = proxies[idx[0]]
                 idx[0] += 1
@@ -550,6 +784,61 @@ def proxy_transport_error(err):
     return False
 
 
+LOGIN_GAP = 2.4
+_login_slots = {}
+_login_slots_lock = threading.Lock()
+
+
+def wait_login_slot(session, stop_event, gap=LOGIN_GAP):
+    """One XML-RPC login at a time per exit IP. Bursting trips fault 11."""
+    px = getattr(session, 'proxy', None)
+    key = session_bind_ip(session) or (px.key() if px else 'direct')
+    while not session_halted(session, stop_event):
+        delay = 0.0
+        with _login_slots_lock:
+            last = float(_login_slots.get(key, 0) or 0)
+            now = time.time()
+            remain = gap - (now - last)
+            if remain <= 0:
+                _login_slots[key] = now
+                return True
+            delay = remain
+        if stop_event is not None:
+            if stop_event.wait(delay):
+                return False
+        else:
+            time.sleep(delay)
+    return False
+
+
+def arm_login_cooldown(session):
+    n = getattr(session, '_login_blocks', 0) + 1
+    session._login_blocks = n
+    wait = min(90.0, 15.0 * n)
+    session._login_cooldown_until = time.time() + wait
+    return wait
+
+
+def account_login_cooling(session):
+    return time.time() < float(getattr(session, '_login_cooldown_until', 0) or 0)
+
+
+def login_ip_blocked(err):
+    """IMVU rate-limit / lockout tied to the current exit IP."""
+    text = str(err).lower()
+    if 'too many failed' in text:
+        return True
+    if 'fault 11' in text or 'fault  11' in text:
+        return True
+    if 'try again later' in text and 'login' in text:
+        return True
+    return False
+
+
+def should_rotate_proxy(err):
+    return proxy_transport_error(err) or login_ip_blocked(err)
+
+
 class ProxyPool(object):
     def __init__(self):
         self.lock = threading.Lock()
@@ -557,6 +846,7 @@ class ProxyPool(object):
         self.reserve = []
         self.users = {}
         self.bad = set()
+        self.bad_subnets = set()
         self.seen = set()
         self.fails = {}
         self.assigned = {}
@@ -575,13 +865,13 @@ class ProxyPool(object):
 
     def live_count(self):
         with self.lock:
-            return len([p for p in self.live if p.key() not in self.bad])
+            return len([p for p in self.live if not self._blocked_spec(p)])
 
     def free_slots(self):
         with self.lock:
             n = 0
             for spec in self.live:
-                if spec.key() in self.bad:
+                if self._blocked_spec(spec):
                     continue
                 used = len(self.users.get(spec.key(), set()))
                 n += max(0, self.per_ip - used)
@@ -601,12 +891,30 @@ class ProxyPool(object):
             bucket.discard(username)
         return cur
 
-    def _pick(self):
+    def _subnet(self, host):
+        parts = (host or '').split('.')
+        if len(parts) == 4:
+            return '.'.join(parts[:3])
+        return host or ''
+
+    def _blocked_spec(self, spec, skip=None):
+        if spec is None:
+            return True
+        if spec.key() in self.bad:
+            return True
+        if skip and spec.key() == skip:
+            return True
+        net = self._subnet(spec.host)
+        if net and net in self.bad_subnets:
+            return True
+        return False
+
+    def _pick(self, skip=None):
         """Least-loaded live proxy with room (IMVU cap = PROXY_PER_IP)."""
         best = None
         best_n = None
         for spec in self.live:
-            if spec.key() in self.bad:
+            if self._blocked_spec(spec, skip):
                 continue
             n = len(self.users.get(spec.key(), set()))
             if n >= self.per_ip:
@@ -618,11 +926,11 @@ class ProxyPool(object):
                     break
         return best
 
-    def claim(self, session):
+    def claim(self, session, skip=None):
         with self.lock:
             name = session.username
             cur = self.assigned.get(name)
-            if cur and cur.key() not in self.bad:
+            if cur and not self._blocked_spec(cur, skip):
                 used = self.users.get(cur.key(), set())
                 if name in used or len(used) < self.per_ip:
                     if name not in used:
@@ -632,7 +940,7 @@ class ProxyPool(object):
                     return cur
             if cur:
                 self._unassign(name)
-            spec = self._pick()
+            spec = self._pick(skip)
             if spec is None:
                 session.proxy = None
                 return None
@@ -651,7 +959,7 @@ class ProxyPool(object):
 
     def _add_live(self, spec):
         with self.lock:
-            if spec.key() in self.bad:
+            if spec.key() in self.bad or self._subnet(spec.host) in self.bad_subnets:
                 return False
             keys = set(p.key() for p in self.live)
             if spec.key() in keys:
@@ -661,34 +969,57 @@ class ProxyPool(object):
             return True
 
     def promote(self, count=1):
+        take = max(count * 3, count)
+        cands = []
+        with self.lock:
+            while len(cands) < take and self.reserve:
+                cand = self.reserve.pop(0)
+                if cand.key() not in self.bad and self._subnet(cand.host) not in self.bad_subnets:
+                    cands.append(cand)
+        if not cands:
+            return 0
+        found = probe_all(cands, self._check, workers=min(20, len(cands)))
         added = 0
-        while added < count:
-            with self.lock:
-                spec = None
-                while self.reserve:
-                    cand = self.reserve.pop(0)
-                    if cand.key() not in self.bad:
-                        spec = cand
-                        break
-            if spec is None:
-                return added
-            if self._check(spec) and self._add_live(spec):
+        for spec in found:
+            if self._add_live(spec):
                 added += 1
-                _proxy_note('proxy + %s (%s)' % (spec.host, self.status_line()))
+        if added:
+            _proxy_note('proxy +%d (%s)' % (added, self.status_line()))
         return added
 
-    def rotate(self, session):
+    def note_ok(self, spec):
+        if spec is None:
+            return
+        with self.lock:
+            self.fails[spec.key()] = 0
+
+    def _note_fail(self, spec):
+        key = spec.key()
+        n = self.fails.get(key, 0) + 1
+        self.fails[key] = n
+        if n >= PROXY_FAILS_BEFORE_BAD:
+            self.bad.add(key)
+            _proxy_note('drop %s after %d fails' % (spec.host, n))
+        return n
+
+    def rotate(self, session, burn=False):
         with self.lock:
             name = session.username
             old = self._unassign(name)
+            skip = old.key() if old else None
             if old:
-                self.bad.add(old.key())
-        nxt = self.claim(session)
-        if nxt is None or (old and nxt.key() == old.key()):
+                if burn:
+                    self.bad.add(old.key())
+                    net = self._subnet(old.host)
+                    if net:
+                        self.bad_subnets.add(net)
+                    _proxy_note('imvu blocked %s · skip %s.*' % (old.host, net or old.host))
+                else:
+                    self._note_fail(old)
+        nxt = self.claim(session, skip=skip)
+        if nxt is None:
             self.promote(2)
-            nxt = self.claim(session)
-            if old and nxt and nxt.key() == old.key():
-                nxt = None
+            nxt = self.claim(session, skip=skip)
         return old, nxt
 
     def release(self, session):
@@ -753,12 +1084,17 @@ class ProxyPool(object):
                     if self._opts is not None:
                         self._fetch_more(self._opts)
                     last_fetch = time.time()
-                self.promote(3)
+                added = self.promote(6)
+                if added:
+                    continue
+                wait = 2.0
+            else:
+                wait = 8.0
             if stop is not None:
-                if stop.wait(8.0):
+                if stop.wait(wait):
                     return
             else:
-                time.sleep(8.0)
+                time.sleep(wait)
 
     def claim_wait(self, session, stop_event=None, timeout=None):
         stop = stop_event or getattr(session, 'stop_event', None)
@@ -796,13 +1132,76 @@ def _proxy_note(text):
     log(_P(), text)
 
 
+def _net_note(text):
+    class _N(object):
+        username = 'net'
+    log(_N(), text)
+
+
+def prepare_split(opts, accounts):
+    """Bind first N bots to the PC nic, next M to the phone hotspot."""
+    try:
+        pc_n = max(0, int(getattr(opts, 'split_pc', 0) or 0))
+    except (TypeError, ValueError):
+        pc_n = 0
+    try:
+        hot_n = max(0, int(getattr(opts, 'split_hot', 0) or 0))
+    except (TypeError, ValueError):
+        hot_n = 0
+    opts.split_pc = pc_n
+    opts.split_hot = hot_n
+    opts.split_auto = False
+    for session in accounts:
+        session.bind_ip = None
+        session.bind_via = ''
+    if getattr(opts, 'use_proxy', False):
+        opts.bind_lan = None
+        opts.bind_hot = None
+        return
+    lan, cell, _rows = pick_split_ifs(
+        getattr(opts, 'bind_pc', None),
+        getattr(opts, 'bind_hot', None))
+    opts.bind_lan = lan
+    opts.bind_hot = cell
+    auto = (pc_n == 0 and hot_n == 0)
+    if auto:
+        pc_n, hot_n = auto_split_counts(len(accounts), lan, cell)
+        if pc_n == 0 and hot_n == 0:
+            return
+        opts.split_pc = pc_n
+        opts.split_hot = hot_n
+        opts.split_auto = True
+    if pc_n and not lan:
+        raise BackendError(
+            'no pc nic — keep ethernet/home wifi, phone on usb/wifi')
+    if hot_n and not cell:
+        raise BackendError(
+            'no hotspot — connect the phone (usb or wifi), keep the pc nic')
+    if lan and cell and lan[1] == cell[1]:
+        raise BackendError('pc and hotspot resolved to the same nic')
+    for i, session in enumerate(accounts):
+        if i < pc_n and lan:
+            session.bind_ip = lan[1]
+            session.bind_via = 'pc'
+        elif i < pc_n + hot_n and cell:
+            session.bind_ip = cell[1]
+            session.bind_via = 'hot'
+    used_pc = sum(1 for s in accounts if s.bind_via == 'pc')
+    used_hot = sum(1 for s in accounts if s.bind_via == 'hot')
+    _net_note('via %d pc %s · %d hot %s%s'
+              % (used_pc, lan[1] if lan else '-',
+                 used_hot, cell[1] if cell else '-',
+                 ' · auto' if auto else ''))
+
+
 def prepare_proxies(opts):
     opts.proxy_pool = None
     if not getattr(opts, 'use_proxy', False):
         return 0
     here = os.path.dirname(os.path.abspath(__file__))
     path = getattr(opts, 'proxies_file', None) or os.path.join(here, 'proxies.txt')
-    found = load_proxies_file(path)
+    file_found = load_proxies_file(path)
+    found = list(file_found)
     found.extend(collect_proxies_from_apis(opts))
     seen = set()
     unique = []
@@ -811,20 +1210,22 @@ def prepare_proxies(opts):
             continue
         seen.add(spec.key())
         unique.append(spec)
-    file_keys = set(p.key() for p in load_proxies_file(path))
+    file_keys = set(p.key() for p in file_found)
     keep = [p for p in unique if p.key() in file_keys]
     rest = [p for p in unique if p.key() not in file_keys]
     random.shuffle(rest)
     unique = keep + rest
     n_accounts = int(getattr(opts, 'total_accounts', 0)
                      or getattr(opts, 'count', 0) or 8)
-    need = proxies_needed(n_accounts)
-    want = min(16, max(need + 3, need * 2, 3))
+    per_ip = PROXY_PER_IP if file_found else PROXY_PER_FREE
+    need = proxies_needed(n_accounts, per_ip)
+    want = min(24, max(need + 3, 3))
+    start_min = min(need, 4 if per_ip == PROXY_PER_FREE else need)
     login_host = getattr(opts, 'secure_host', None) or 'secure.imvu.com'
     login_path = getattr(opts, 'client_endpoint', None) or '/api/xmlrpc/client.php'
     imq_host = getattr(opts, 'imq_host', None) or None
     _proxy_note('need %d ips (%d agents · %d/ip) · hunting %d'
-                % (need, n_accounts, PROXY_PER_IP, len(unique)))
+                % (need, n_accounts, per_ip, len(unique)))
 
     def check(spec):
         return probe_proxy_imvu(spec, login_host, login_path, imq_host=imq_host)
@@ -832,16 +1233,24 @@ def prepare_proxies(opts):
     live = []
     leftover = unique[:]
     checked = 0
-    max_check = 280
+    max_check = 96
     while leftover and len(live) < want and checked < max_check:
-        batch = leftover[:32]
-        leftover = leftover[32:]
+        batch = leftover[:24]
+        leftover = leftover[24:]
         checked += len(batch)
-        live.extend(probe_proxies(batch, want - len(live), check))
-        if len(live) >= need and checked >= 96 and len(live) >= want:
+        live.extend(probe_proxies(batch, want - len(live), check, workers=24))
+        _proxy_note('probe %d · %d live (need %d)'
+                    % (checked, len(live), need))
+        if len(live) >= want:
             break
-        if len(live) >= need and checked >= 160:
+        if per_ip == PROXY_PER_FREE and len(live) >= start_min and checked >= 24:
             break
+    if not live:
+        extra = leftover[:96]
+        leftover = leftover[96:]
+        if extra:
+            _proxy_note('none yet · probing %d more' % len(extra))
+            live.extend(probe_proxies(extra, need, check, workers=24))
     if not live:
         raise BackendError('no working proxies from api')
     pool = ProxyPool()
@@ -853,6 +1262,7 @@ def prepare_proxies(opts):
     pool.imq_host = imq_host
     pool.probe_host = login_host
     pool.probe_port = 443
+    pool.per_ip = per_ip
     pool.need = need
     pool.want = want
     pool.n_accounts = n_accounts
@@ -873,18 +1283,32 @@ def run_via_proxy(session, opts, fn):
     last = None
     for _ in range(tries):
         try:
-            return fn()
+            out = fn()
+            if pool:
+                pool.note_ok(getattr(session, 'proxy', None))
+            return out
         except Exception as e:
             last = e
-            if not pool or not proxy_transport_error(e):
+            if login_ip_blocked(e):
+                if not pool:
+                    raise
+                old, nxt = pool.rotate(session, burn=True)
+                old_ip = old.host if old else '?'
+                if nxt is None:
+                    if pool.claim_wait(session, stop_event=stop):
+                        continue
+                    raise
+                log(session, 'imvu blocked %s — new ip %s' % (old_ip, nxt.host))
+                continue
+            if not pool or not should_rotate_proxy(e):
                 raise
-            old, nxt = pool.rotate(session)
+            old, nxt = pool.rotate(session, burn=False)
             old_ip = old.host if old else '?'
             if nxt is None:
                 if pool.claim_wait(session, stop_event=stop):
                     continue
                 raise BackendError('proxy dead %s — none left' % old_ip)
-            log(session, 'proxy dead %s — retry %s' % (old_ip, nxt.host))
+            log(session, 'proxy fail %s — retry %s' % (old_ip, nxt.host))
     raise last
 
 
@@ -892,14 +1316,17 @@ def bump_proxy(session, opts, err=None):
     pool = getattr(opts, 'proxy_pool', None)
     if not pool:
         return
-    if err is not None and not proxy_transport_error(err):
+    if err is not None and not should_rotate_proxy(err):
         pool.ensure(session)
         return
-    old, nxt = pool.rotate(session)
+    old, nxt = pool.rotate(session, burn=login_ip_blocked(err))
     if old and nxt:
-        log(session, 'proxy dead %s — retry %s' % (old.host, nxt.host))
+        if login_ip_blocked(err):
+            log(session, 'imvu blocked %s — new ip %s' % (old.host, nxt.host))
+        else:
+            log(session, 'proxy fail %s — retry %s' % (old.host, nxt.host))
     elif old and nxt is None:
-        log(session, 'proxy dead %s — none left' % old.host)
+        log(session, 'proxy fail %s — none left' % old.host)
 
 
 def http_exchange(sock, method, path, headers, body, timeout):
@@ -926,8 +1353,8 @@ def http_exchange(sock, method, path, headers, body, timeout):
     return status, data
 
 
-def urlopen_bytes(req, timeout=30, context=None, proxy=None):
-    if proxy is None:
+def urlopen_bytes(req, timeout=30, context=None, proxy=None, bind_ip=None):
+    if proxy is None and not bind_ip:
         with urllib.request.urlopen(req, timeout=timeout, context=context) as resp:
             return resp.getcode(), resp.read()
     parsed = urllib.parse.urlparse(req.full_url)
@@ -936,7 +1363,7 @@ def urlopen_bytes(req, timeout=30, context=None, proxy=None):
     path = parsed.path or '/'
     if parsed.query:
         path += '?' + parsed.query
-    raw = open_via_proxy(host, port, proxy, timeout)
+    raw = open_tcp(host, port, timeout, proxy=proxy, bind_ip=bind_ip)
     try:
         if parsed.scheme == 'https':
             if context is None:
@@ -958,8 +1385,11 @@ def urlopen_bytes(req, timeout=30, context=None, proxy=None):
 
 def xmlrpc_call(url, method, params, auth=None, insecure=False, timeout=30,
                 proxy=None, session=None):
-    if proxy is None and session is not None:
-        proxy = getattr(session, 'proxy', None)
+    bind_ip = None
+    if session is not None:
+        bind_ip = session_bind_ip(session)
+        if proxy is None:
+            proxy = getattr(session, 'proxy', None)
     body = xmlrpc.client.dumps(params, methodname=method).encode('utf-8')
     headers = {
         'Content-Type': 'text/xml',
@@ -980,7 +1410,7 @@ def xmlrpc_call(url, method, params, auth=None, insecure=False, timeout=30,
         context.verify_mode = ssl.CERT_NONE
     try:
         status, data = urlopen_bytes(req, timeout=timeout, context=context,
-                                     proxy=proxy)
+                                     proxy=proxy, bind_ip=bind_ip)
         if status >= 400:
             raise BackendError('HTTP %s from %s: %s' % (status, url, data[:200]))
     except BackendError:
@@ -1014,13 +1444,15 @@ def detect_key(info, candidates, override, what):
 # --- IMQ socket client -------------------------------------------------------
 
 class ImqClient(object):
-    def __init__(self, host, port, use_tls, insecure, timeout=15.0, proxy=None):
+    def __init__(self, host, port, use_tls, insecure, timeout=15.0, proxy=None,
+                 bind_ip=None):
         self.host = host
         self.port = port
         self.use_tls = use_tls
         self.insecure = insecure
         self.timeout = timeout
         self.proxy = proxy
+        self.bind_ip = bind_ip
         self.sock = None
         self.buf = bytearray()
         self.op_id = 0
@@ -1038,11 +1470,8 @@ class ImqClient(object):
         return self.op_id
 
     def open(self):
-        if self.proxy:
-            raw = open_via_proxy(self.host, self.port, self.proxy, self.timeout)
-        else:
-            raw = socket.create_connection((self.host, self.port),
-                                           timeout=self.timeout)
+        raw = open_tcp(self.host, self.port, self.timeout,
+                       proxy=self.proxy, bind_ip=self.bind_ip)
         if self.use_tls:
             if self.insecure:
                 context = ssl.create_default_context()
@@ -1265,7 +1694,12 @@ class AccountSession(object):
         self.spam_thread = None
         self.joined_at = 0
         self._left_noted = False
+        self._imq_pending = False
+        self._login_blocks = 0
+        self._login_cooldown_until = 0
         self.proxy = None
+        self.bind_ip = None
+        self.bind_via = ''
 
 
 def probe_chat(session, info, opts, chat_id, timeout=30):
@@ -1303,7 +1737,8 @@ def find_rooms(session, info, opts, keywords):
     context = insecure_context(opts)
     try:
         _status, raw_b = urlopen_bytes(req, timeout=30, context=context,
-                                       proxy=getattr(session, 'proxy', None))
+                                       proxy=getattr(session, 'proxy', None),
+                                       bind_ip=session_bind_ip(session))
         raw = raw_b.decode('utf-8', 'replace')
     except urllib.error.HTTPError as e:
         raise BackendError('HTTP %s from room search: %s'
@@ -1379,6 +1814,79 @@ def login(session, opts):
     return info
 
 
+def bind_used(opts, via):
+    n = 0
+    for other in getattr(opts, 'sessions', None) or []:
+        if other.halt.is_set():
+            continue
+        if getattr(other, 'bind_via', '') == via:
+            n += 1
+    return n
+
+
+def failover_bind(session, opts):
+    """Move this bot to the other local nic after IMVU blocks the current IP."""
+    lan = getattr(opts, 'bind_lan', None)
+    cell = getattr(opts, 'bind_hot', None)
+    if not lan or not cell or lan[1] == cell[1]:
+        return False
+    tried = getattr(session, '_bind_tried', None)
+    if tried is None:
+        tried = set()
+        session._bind_tried = tried
+    if session.bind_ip:
+        tried.add(session.bind_ip)
+    cur = getattr(session, 'bind_via', '') or 'pc'
+    if cur == 'hot':
+        dest, spec = 'pc', lan
+    else:
+        dest, spec = 'hot', cell
+    if spec[1] in tried:
+        return False
+    if bind_used(opts, dest) >= PROXY_PER_IP:
+        return False
+    old = session.bind_ip or cur
+    session.bind_ip = spec[1]
+    session.bind_via = dest
+    log(session, 'imvu blocked %s — via %s %s' % (old, dest, spec[1]))
+    return True
+
+
+def login_until(session, opts, stop_event):
+    """Keep trying XML-RPC login; do not kill the agent thread on one miss."""
+    while not session_halted(session, stop_event):
+        session.phase = 'login'
+        if not wait_login_slot(session, stop_event):
+            return None
+        try:
+            info = login(session, opts)
+            session.info = info
+            session.cid = detect_key(info, CID_KEYS, opts.cid_key, 'customer id')
+            session._login_blocks = 0
+            session._login_cooldown_until = 0
+            mark_logged_in(session)
+            return info
+        except Exception as e:
+            session.error = str(e)
+            if login_ip_blocked(e):
+                if getattr(opts, 'proxy_pool', None):
+                    log(session, 'imvu blocked ip · retry other ip')
+                    wait = 0.35
+                else:
+                    wait = arm_login_cooldown(session)
+                    log(session, 'login limited · wait %.0fs (same ip)'
+                        % wait)
+                    if getattr(session, '_login_blocks', 0) >= 3:
+                        failover_bind(session, opts)
+            else:
+                log(session, 'login retry: %s' % str(e).split('\n')[0][:70])
+                bump_proxy(session, opts, e)
+                wait = 1.0
+            if stop_event is not None and stop_event.wait(wait):
+                return None
+    return None
+
+
 def imq_connect_args(opts, info):
     host = opts.imq_host or (info or {}).get('imq_gateway_secure_host')
     if not host:
@@ -1392,35 +1900,73 @@ def imq_connect_args(opts, info):
     return host, cookie, token
 
 
+def imq_needs_relogin(err):
+    text = str(err or '').lower()
+    return 'imq auth failed' in text or 'invalid key' in text
+
+
+def imq_bad_handshake(err):
+    text = str(err or '').lower()
+    return 'expected g2cchallenge' in text or 'got type' in text
+
+
 def connect_user_imq(session, opts, info=None):
-    """Open IMQ with current login bits and subscribe /user/<cid>."""
+    """One IMQ attempt on the current proxy. Caller handles retry."""
     info = info if info is not None else session.info
+    pool = getattr(opts, 'proxy_pool', None)
+    if pool and session.proxy is None:
+        if not pool.claim_wait(session, stop_event=getattr(opts, 'stop_event', None)):
+            raise BackendError('no working proxies')
     host, cookie, token = imq_connect_args(opts, info)
+    if session.imq:
+        try:
+            session.imq.close()
+        except Exception:
+            pass
+        session.imq = None
+    session.imq = ImqClient(host, opts.imq_port, not opts.imq_plain,
+                            opts.insecure, proxy=session.proxy,
+                            bind_ip=session_bind_ip(session))
+    session.imq.debug_frames = opts.debug_frames
+    t0 = time.time()
+    session.imq.connect(str(session.cid), cookie, token)
+    session.imq_ms = (time.time() - t0) * 1000
+    user_queue = '/user/%s' % session.cid
+    session.imq.subscribe(user_queue)
+    mark_imq_ready(session)
+    if session.proxy:
+        log(session, 'IMQ ok (%d ms) via %s' % (session.imq_ms,
+                                                session.proxy.host))
+    elif getattr(session, 'bind_via', None):
+        log(session, 'IMQ ok (%d ms) via %s %s' % (
+            session.imq_ms, session.bind_via, session.bind_ip))
+    else:
+        log(session, 'IMQ ok (%d ms)  sub %s' % (session.imq_ms, user_queue),
+            verbose=True)
+    return session.imq
 
-    def once():
-        if session.imq:
-            try:
-                session.imq.close()
-            except Exception:
-                pass
-            session.imq = None
-        session.imq = ImqClient(host, opts.imq_port, not opts.imq_plain,
-                                opts.insecure, proxy=session.proxy)
-        session.imq.debug_frames = opts.debug_frames
-        t0 = time.time()
-        session.imq.connect(str(session.cid), cookie, token)
-        session.imq_ms = (time.time() - t0) * 1000
-        user_queue = '/user/%s' % session.cid
-        session.imq.subscribe(user_queue)
-        if session.proxy:
-            log(session, 'IMQ ok (%d ms) via %s' % (session.imq_ms,
-                                                    session.proxy.host))
-        else:
-            log(session, 'IMQ ok (%d ms)  sub %s' % (session.imq_ms, user_queue),
-                verbose=True)
-        return session.imq
 
-    return run_via_proxy(session, opts, once)
+def recover_after_imq_drop(session, opts, stop_event, imq_fails):
+    """Reconnect IMQ. Closed-by-peer is not a dead login — do not relogin."""
+    drop_imq(session, opts, count_leave=False, keep_status=True)
+    err = session.error or ''
+    rotate = imq_bad_handshake(err) or imq_fails >= 2
+    relogin = (imq_needs_relogin(err)
+               and not account_login_cooling(session)
+               and not login_ip_blocked(err))
+    if rotate:
+        bump_proxy(session, opts, err or 'closed')
+    if relogin:
+        log(session, 'relogin after IMQ auth fail')
+        if not relogin_session(session, opts):
+            if stop_event is not None and stop_event.wait(2.0):
+                return True
+    else:
+        log(session, 'IMQ retry %d (same login)' % imq_fails)
+    wait = min(6.0, 0.6 + 0.8 * imq_fails)
+    if stop_event is not None and stop_event.wait(wait):
+        return True
+    return False
 
 
 def chat_url(opts):
@@ -1712,7 +2258,7 @@ def session_offline(session):
     """Has a cid but IMQ is dead — cannot receive invites or chat."""
     if session.halt is not None and session.halt.is_set():
         return False
-    if (session.phase or '') == 'login':
+    if (session.phase or '') == 'login' or getattr(session, '_imq_pending', False):
         return False
     if not session.cid:
         return False
@@ -1728,13 +2274,30 @@ def effective_phase(session):
     if session.halt is not None and session.halt.is_set():
         return 'down'
     phase = session.phase or 'idle'
-    if phase == 'login':
-        return 'login'
+    if not session.cid:
+        return 'login' if phase == 'login' else phase
     if phase in ('in-room', 'spam') and still_in_chat(session):
         if phase == 'spam' and not spam_loop_alive(session):
             return 'in-room'
         return phase
-    return _phase_if_not_in_room(session)
+    if imq_alive(session):
+        return 'idle'
+    if phase == 'login' or getattr(session, '_imq_pending', False):
+        return 'imq'
+    return 'down'
+
+
+def mark_logged_in(session):
+    """XML-RPC login done. TUI shows imq until the gateway socket is up."""
+    session._imq_pending = True
+    if session.phase not in ('in-room', 'spam'):
+        session.phase = 'idle'
+
+
+def mark_imq_ready(session):
+    session._imq_pending = False
+    if session.phase not in ('in-room', 'spam'):
+        session.phase = 'idle'
 
 
 def wait_for_invite(session, opts, reason=None):
@@ -1760,7 +2323,7 @@ def wait_for_invite(session, opts, reason=None):
             imq.closed_by_server = True
         log(session, 'offline  —  will relogin')
         return
-    session.phase = 'idle'
+    mark_imq_ready(session)
     session.error = None
     bind_imq_session(session, opts, None)
     log(session, 'waiting for invite')
@@ -1926,27 +2489,44 @@ def bind_imq_session(session, opts, chat_queue=None):
 
 
 def relogin_session(session, opts):
+    if account_login_cooling(session) and session.info and session.cid:
+        log(session, 'skip relogin · cooldown')
+        mark_logged_in(session)
+        return True
     lock = getattr(session, '_relogin_lock', None)
     if lock is None:
         lock = threading.Lock()
         session._relogin_lock = lock
     if not lock.acquire(False):
-        return False
-    session.phase = 'login'
+        return bool(session.info and session.cid)
+    if session.info and session.cid:
+        session.phase = 'idle'
+        session._imq_pending = True
+    else:
+        session.phase = 'login'
     log(session, 'relogin')
     try:
         info = login(session, opts)
         session.info = info
         session.cid = detect_key(info, CID_KEYS, opts.cid_key, 'customer id')
         session.error = None
-        session.phase = 'login' if not imq_alive(session) else 'idle'
+        session._login_blocks = 0
+        session._login_cooldown_until = 0
+        if imq_alive(session):
+            mark_imq_ready(session)
+        else:
+            mark_logged_in(session)
         log(session, 'online')
         return True
     except Exception as e:
         session.error = str(e)
+        if login_ip_blocked(e) and session.info and session.cid:
+            log(session, 'relogin: imvu blocked ip · keep session')
+            mark_logged_in(session)
+            return True
         session.phase = 'down'
         log(session, 'relogin failed: %s' % e)
-        return False
+        return bool(session.info and session.cid)
     finally:
         lock.release()
 
@@ -2142,7 +2722,8 @@ def fetch_avatar_name(session, opts, cid):
     context = insecure_context(opts)
     try:
         _status, raw_b = urlopen_bytes(req, timeout=15, context=context,
-                                       proxy=getattr(session, 'proxy', None))
+                                       proxy=getattr(session, 'proxy', None),
+                                       bind_ip=session_bind_ip(session))
         raw = raw_b.decode('utf-8', 'replace')
         data = json.loads(raw)
     except Exception:
@@ -2329,7 +2910,7 @@ def reconcile_session(session, opts):
     """If IMQ or the spam thread died, do not keep showing in-room/spam."""
     if session.halt is not None and session.halt.is_set():
         return
-    if (session.phase or '') == 'login':
+    if (session.phase or '') == 'login' or getattr(session, '_imq_pending', False):
         return
     if getattr(session, '_left_noted', False) or not session.chat_id:
         if session.phase in ('in-room', 'spam', 'idle', 'down'):
@@ -2879,7 +3460,7 @@ def run_churn(session, info, opts, stop_event, stats_lock):
             break
 
 
-def drop_imq(session, opts, count_leave=False):
+def drop_imq(session, opts, count_leave=False, keep_status=False):
     """Tear down IMQ without treating it as an intentional leave."""
     if session.spam_stop is not None:
         session.spam_stop.set()
@@ -2898,7 +3479,12 @@ def drop_imq(session, opts, count_leave=False):
     if count_leave:
         with opts.stats_lock:
             opts.stats['left'] += 1
-    session.phase = 'down'
+    if keep_status and session.cid:
+        session._imq_pending = True
+        if session.phase not in ('in-room', 'spam'):
+            session.phase = 'idle'
+    else:
+        session.phase = 'down'
 
 
 def arm_trigger(session, opts, queue):
@@ -2917,14 +3503,15 @@ def run_account(session, opts, stop_event, stats_lock):
         run_listen_invite(session, opts, stop_event, stats_lock)
         return
     try:
-        session.phase = 'login'
         t0 = time.time()
-        info = login(session, opts)
-        session.info = info
+        info = login_until(session, opts, stop_event)
+        if not info or not session.cid:
+            return
         session.login_ms = (time.time() - t0) * 1000
-        session.cid = detect_key(info, CID_KEYS, opts.cid_key, 'customer id')
         if session.proxy:
             log(session, 'online via %s' % session.proxy.host)
+        elif getattr(session, 'bind_via', None):
+            log(session, 'online via %s %s' % (session.bind_via, session.bind_ip))
         else:
             log(session, 'online')
 
@@ -2953,9 +3540,7 @@ def run_account(session, opts, stop_event, stats_lock):
                 if session_halted(session, stop_event):
                     break
                 session.error = str(e)
-                session.phase = 'down'
                 log(session, 'ERROR: %s' % e)
-                bump_proxy(session, opts, e)
                 with stats_lock:
                     opts.stats['errors'] += 1
             if session_halted(session, stop_event) or opts.hold > 0:
@@ -2965,21 +3550,11 @@ def run_account(session, opts, stop_event, stats_lock):
             if not dropped:
                 break
             log(session, 'rejoining')
-            drop_imq(session, opts)
-            err = session.error or ''
-            if 'no working prox' in err.lower() or 'none left' in err.lower():
-                if stop_event.wait(3.0):
-                    break
-                continue
-            if session.error:
-                bump_proxy(session, opts, session.error)
-            if not relogin_session(session, opts):
-                if stop_event.wait(2.0):
-                    break
-                continue
-            info = session.info
-            if stop_event.wait(0.4):
+            if recover_after_imq_drop(session, opts, stop_event, 2):
                 break
+            info = session.info
+            session.error = None
+            continue
     finally:
         drop_imq(session, opts, count_leave=False)
         px = getattr(opts, 'proxy_pool', None)
@@ -3106,6 +3681,14 @@ def main(argv=None):
                         help='send each account through a proxy (spread load)')
     parser.add_argument('--proxy-api', default=DEFAULT_PROXY_API,
                         help='URL that returns ip:port lines (SOCKS5 preferred)')
+    parser.add_argument('--split-pc', type=int, default=0,
+                        help='bots bound to the PC nic (ethernet / home wifi)')
+    parser.add_argument('--split-hot', type=int, default=0,
+                        help='bots bound to the phone hotspot nic')
+    parser.add_argument('--bind-pc', default='',
+                        help='force PC nic IPv4 for --split-pc')
+    parser.add_argument('--bind-hot', default='',
+                        help='force hotspot nic IPv4 for --split-hot')
 
     parser.add_argument('--client-version', default='554.0')
     parser.add_argument('--cid-key', help='customer id key in login response')
@@ -3172,6 +3755,7 @@ def run_load(opts):
         return 1
 
     try:
+        prepare_split(opts, accounts)
         prepare_proxies(opts)
     except BackendError as e:
         if not getattr(opts, 'tui', False):
@@ -3518,14 +4102,16 @@ def make_invite_handler(session, opts):
 
 def run_listen_invite(session, opts, stop_event, stats_lock):
     try:
-        session.phase = 'login'
         t0 = time.time()
-        info = login(session, opts)
-        session.info = info
+        info = login_until(session, opts, stop_event)
+        if not info or not session.cid:
+            return
         session.login_ms = (time.time() - t0) * 1000
-        session.cid = detect_key(info, CID_KEYS, opts.cid_key, 'customer id')
         if session.proxy:
             log(session, 'waiting for invite via %s' % session.proxy.host)
+        elif getattr(session, 'bind_via', None):
+            log(session, 'waiting for invite via %s %s'
+                % (session.bind_via, session.bind_ip))
         else:
             log(session, 'waiting for invite')
         with stats_lock:
@@ -3534,12 +4120,13 @@ def run_listen_invite(session, opts, stop_event, stats_lock):
             if not getattr(opts, 'tui', False):
                 print('INVITE CIDS: ' + ','.join(opts.ready_cids), flush=True)
 
+        imq_fails = 0
         while not session_halted(session, stop_event):
             try:
                 connect_user_imq(session, opts)
                 session.error = None
-                if session.phase not in ('in-room', 'spam'):
-                    session.phase = 'idle'
+                imq_fails = 0
+                mark_imq_ready(session)
                 bind_imq_session(session, opts, (
                     chat_queue_name(session.chat_id)
                     if session.chat_id else None))
@@ -3551,9 +4138,7 @@ def run_listen_invite(session, opts, stop_event, stats_lock):
                 if session_halted(session, stop_event):
                     break
                 session.error = str(e)
-                session.phase = 'down'
                 log(session, 'ERROR: %s' % e)
-                bump_proxy(session, opts, e)
                 with stats_lock:
                     opts.stats['errors'] += 1
             if session_halted(session, stop_event) or opts.hold > 0:
@@ -3562,20 +4147,11 @@ def run_listen_invite(session, opts, stop_event, stats_lock):
                        or session.error)
             if not dropped:
                 break
-            log(session, 'reconnecting')
-            drop_imq(session, opts)
-            err = session.error or ''
-            if 'no working prox' in err.lower() or 'none left' in err.lower():
-                if stop_event.wait(3.0):
-                    break
-                continue
-            bump_proxy(session, opts, session.error or 'closed')
-            if not relogin_session(session, opts):
-                if stop_event.wait(2.0):
-                    break
-                continue
-            if stop_event.wait(0.4):
+            imq_fails += 1
+            if recover_after_imq_drop(session, opts, stop_event, imq_fails):
                 break
+            session.error = None
+            continue
     finally:
         drop_imq(session, opts, count_leave=False)
         px = getattr(opts, 'proxy_pool', None)
