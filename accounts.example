@@ -1,0 +1,6 @@
+# Test accounts for roomload.py - one per line: username:password
+# Copy this file to accounts.txt and fill in YOUR OWN backend's test accounts.
+# accounts.txt is gitignored; never commit real credentials.
+zabbix:123456
+zabbix2:123456
+zabbix3:123456
