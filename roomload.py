@@ -784,31 +784,66 @@ def proxy_transport_error(err):
     return False
 
 
-LOGIN_GAP = 2.4
+LOGIN_DELAY = 2.0
 _login_slots = {}
+_login_locks = {}
 _login_slots_lock = threading.Lock()
 
 
-def wait_login_slot(session, stop_event, gap=LOGIN_GAP):
-    """One XML-RPC login at a time per exit IP. Bursting trips fault 11."""
+def _login_exit_key(session):
     px = getattr(session, 'proxy', None)
-    key = session_bind_ip(session) or (px.key() if px else 'direct')
-    while not session_halted(session, stop_event):
-        delay = 0.0
-        with _login_slots_lock:
-            last = float(_login_slots.get(key, 0) or 0)
-            now = time.time()
-            remain = gap - (now - last)
+    return session_bind_ip(session) or (px.key() if px else 'direct')
+
+
+def wait_login_slot(session, stop_event, gap=None):
+    """Serialize logins per exit IP and wait after the previous one finishes."""
+    if gap is None:
+        gap = LOGIN_DELAY
+    try:
+        gap = float(gap)
+    except (TypeError, ValueError):
+        gap = LOGIN_DELAY
+    if gap < 0:
+        gap = 0
+    key = _login_exit_key(session)
+    with _login_slots_lock:
+        lock = _login_locks.setdefault(key, threading.Lock())
+    lock.acquire()
+    session._login_slot_lock = lock
+    try:
+        while not session_halted(session, stop_event):
+            with _login_slots_lock:
+                last = float(_login_slots.get(key, 0) or 0)
+            remain = last + gap - time.time()
             if remain <= 0:
-                _login_slots[key] = now
                 return True
-            delay = remain
-        if stop_event is not None:
-            if stop_event.wait(delay):
-                return False
-        else:
-            time.sleep(delay)
+            if remain > 0.4:
+                log(session, 'login delay %.0fs' % remain)
+            if stop_event is not None:
+                if stop_event.wait(remain):
+                    break
+            else:
+                time.sleep(remain)
+    except Exception:
+        lock.release()
+        session._login_slot_lock = None
+        raise
+    lock.release()
+    session._login_slot_lock = None
     return False
+
+
+def finish_login_slot(session):
+    key = _login_exit_key(session)
+    with _login_slots_lock:
+        _login_slots[key] = time.time()
+    lock = getattr(session, '_login_slot_lock', None)
+    if lock is not None:
+        try:
+            lock.release()
+        except Exception:
+            pass
+        session._login_slot_lock = None
 
 
 def arm_login_cooldown(session):
@@ -823,16 +858,40 @@ def account_login_cooling(session):
     return time.time() < float(getattr(session, '_login_cooldown_until', 0) or 0)
 
 
+def login_rejected(err):
+    """Any XML-RPC fault 11 — IMVU's generic login failure, not only rate-limit."""
+    text = str(err).lower()
+    return 'fault 11' in text or 'fault  11' in text
+
+
 def login_ip_blocked(err):
-    """IMVU rate-limit / lockout tied to the current exit IP."""
+    """Only when IMVU's own text says the exit is rate-limited."""
     text = str(err).lower()
     if 'too many failed' in text:
-        return True
-    if 'fault 11' in text or 'fault  11' in text:
         return True
     if 'try again later' in text and 'login' in text:
         return True
     return False
+
+
+def exit_key(session):
+    px = getattr(session, 'proxy', None)
+    if px:
+        return px.key()
+    return session_bind_ip(session) or 'direct'
+
+
+def same_exit_online(opts, session):
+    """Another bot already logged in on this same IP — not a dead exit."""
+    key = exit_key(session)
+    for other in getattr(opts, 'sessions', None) or []:
+        if other is session or other.halt.is_set():
+            continue
+        if exit_key(other) != key:
+            continue
+        if other.cid and other.info:
+            return other.username
+    return None
 
 
 def should_rotate_proxy(err):
@@ -1790,28 +1849,37 @@ def load_accounts(path, count):
 
 
 def login(session, opts):
-    url = '%s://%s%s' % (opts.secure_scheme, opts.secure_host, opts.client_endpoint)
-    params = {
-        'avatarname': session.username,
-        'client_version': opts.client_version,
-        'system_info': {},
-        'client_type': 'imvu',
-        'client_experiments': [],
-        'password': session.password,
-    }
-    def once():
-        info = xmlrpc_call(url, 'test.avatarInfoForLogin2', (params,),
-                           insecure=opts.insecure, session=session)
-        if not isinstance(info, dict):
-            raise BackendError('unexpected login response: %r' % (info,))
-        if opts.print_userinfo:
-            log(session, 'userInfo keys: %s' % sorted(info))
+    stop = getattr(opts, 'stop_event', None)
+    gap = getattr(opts, 'login_delay', None)
+    if gap is None:
+        gap = LOGIN_DELAY
+    if not wait_login_slot(session, stop, gap):
+        raise BackendError('stopped')
+    try:
+        url = '%s://%s%s' % (opts.secure_scheme, opts.secure_host, opts.client_endpoint)
+        params = {
+            'avatarname': session.username,
+            'client_version': opts.client_version,
+            'system_info': {},
+            'client_type': 'imvu',
+            'client_experiments': [],
+            'password': session.password,
+        }
+        def once():
+            info = xmlrpc_call(url, 'test.avatarInfoForLogin2', (params,),
+                               insecure=opts.insecure, session=session)
+            if not isinstance(info, dict):
+                raise BackendError('unexpected login response: %r' % (info,))
+            if opts.print_userinfo:
+                log(session, 'userInfo keys: %s' % sorted(info))
+            return info
+        info = run_via_proxy(session, opts, once)
+        pool = getattr(opts, 'proxy_pool', None)
+        if pool is not None:
+            pool.set_imq_host((info or {}).get('imq_gateway_secure_host'))
         return info
-    info = run_via_proxy(session, opts, once)
-    pool = getattr(opts, 'proxy_pool', None)
-    if pool is not None:
-        pool.set_imq_host((info or {}).get('imq_gateway_secure_host'))
-    return info
+    finally:
+        finish_login_slot(session)
 
 
 def bind_used(opts, via):
@@ -1856,8 +1924,6 @@ def login_until(session, opts, stop_event):
     """Keep trying XML-RPC login; do not kill the agent thread on one miss."""
     while not session_halted(session, stop_event):
         session.phase = 'login'
-        if not wait_login_slot(session, stop_event):
-            return None
         try:
             info = login(session, opts)
             session.info = info
@@ -1867,19 +1933,32 @@ def login_until(session, opts, stop_event):
             mark_logged_in(session)
             return info
         except Exception as e:
+            if session_halted(session, stop_event) or str(e) == 'stopped':
+                return None
             session.error = str(e)
+            err_line = str(e).split('\n')[0][:110]
             if login_ip_blocked(e):
-                if getattr(opts, 'proxy_pool', None):
+                peer = same_exit_online(opts, session)
+                if getattr(opts, 'proxy_pool', None) and not peer:
                     log(session, 'imvu blocked ip · retry other ip')
                     wait = 0.35
                 else:
                     wait = arm_login_cooldown(session)
-                    log(session, 'login limited · wait %.0fs (same ip)'
-                        % wait)
+                    log(session, '%s · wait %.0fs' % (err_line, wait))
                     if getattr(session, '_login_blocks', 0) >= 3:
-                        failover_bind(session, opts)
+                        if peer or not failover_bind(session, opts):
+                            session.phase = 'down'
+                            return None
+            elif login_rejected(e):
+                log(session, err_line)
+                n = getattr(session, '_login_blocks', 0) + 1
+                session._login_blocks = n
+                if n >= 2:
+                    session.phase = 'down'
+                    return None
+                wait = 2.0
             else:
-                log(session, 'login retry: %s' % str(e).split('\n')[0][:70])
+                log(session, 'login retry: %s' % err_line)
                 bump_proxy(session, opts, e)
                 wait = 1.0
             if stop_event is not None and stop_event.wait(wait):
@@ -3637,6 +3716,9 @@ def main(argv=None):
                         help='messages (words) per account per visit (default 10)')
     parser.add_argument('--delay', type=float, default=0,
                         help='seconds between repeated messages')
+    parser.add_argument('--login-delay', type=float, default=LOGIN_DELAY,
+                        help='seconds between logins on the same exit IP '
+                             '(default %.0f)' % LOGIN_DELAY)
     parser.add_argument('--ramp', type=float, default=0,
                         help='seconds between account starts')
     parser.add_argument('--hold', type=float, default=0,

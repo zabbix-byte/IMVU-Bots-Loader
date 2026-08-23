@@ -194,6 +194,8 @@ def apply_cfg(opts, cfg):
         opts.union_words = list(r.DEFAULT_UNIONS)
     opts.hold = 0
     opts.tui = True
+    if not getattr(opts, 'login_delay', None):
+        opts.login_delay = r.LOGIN_DELAY
     if not opts.ramp:
         opts.ramp = 1.2 if not opts.use_proxy else 0.35
 
